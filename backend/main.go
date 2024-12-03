@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -27,6 +28,7 @@ const (
     DISK_SIZE       = 50    // 50GB
     DOWNLOAD_SPEED  = 50    // 50Mbps
     UPLOAD_SPEED    = 15    // 15Mbps
+    SSH_PORT_START  = 2200  // Starting port for SSH forwarding
 )
 
 type VPS struct {
@@ -35,6 +37,7 @@ type VPS struct {
     Status      string    `json:"status"`
     QEMUPid     int       `json:"qemu_pid,omitempty"`
     VNCPort     int       `json:"vnc_port"`
+    SSHPort     int       `json:"ssh_port"` 
     CreatedAt   time.Time `json:"created_at"`
     ExpiresAt   time.Time `json:"expires_at"`
     ImagePath   string    `json:"image_path"`
@@ -42,10 +45,11 @@ type VPS struct {
 }
 
 type VPSManager struct {
-    instances   map[string]*VPS
-    mutex       sync.RWMutex
-    nextVNCPort int
-    baseDir     string
+    instances    map[string]*VPS
+    mutex        sync.RWMutex
+    nextVNCPort  int
+    nextSSHPort  int       // Added to track SSH ports
+    baseDir      string
 }
 
 func checkProcess(pid int) error {
@@ -95,9 +99,10 @@ func NewVPSManager(baseDir string) (*VPSManager, error) {
     }
 
     return &VPSManager{
-        instances:   make(map[string]*VPS),
-        nextVNCPort: 5900,
-        baseDir:     baseDir,
+        instances:    make(map[string]*VPS),
+        nextVNCPort:  5900,
+        nextSSHPort:  SSH_PORT_START,
+        baseDir:      baseDir,
     }, nil
 }
 
@@ -161,22 +166,38 @@ func createCloudInitISO(path string, rootPassword string) error {
     }
     defer os.RemoveAll(tmpDir)
 
+    // Updated cloud-init configuration with more explicit password settings
     userData := fmt.Sprintf(`#cloud-config
 users:
   - name: root
     lock_passwd: false
+    passwd: "%s"
+    hashed_passwd: null
     ssh_pwauth: true
 
+# Enable password authentication in SSH
+ssh_pwauth: true
+
+# Disable SSH root lockout
+disable_root: false
+
+# More direct password configuration
 chpasswd:
   list: |
-    root:%s
+     root:%s
   expire: false
 
-ssh_pwauth: true
-disable_root: false
+# Make sure SSH password auth is enabled in sshd_config
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-cloud-init.conf
+    content: |
+        PasswordAuthentication yes
+        PermitRootLogin yes
+
 runcmd:
-  - echo 'root:%s' | chpasswd
-`, rootPassword, rootPassword)
+  - systemctl restart ssh
+  - echo "root:%s" | chpasswd
+`, rootPassword, rootPassword, rootPassword)
 
     if err := os.WriteFile(filepath.Join(tmpDir, "user-data"), []byte(userData), 0644); err != nil {
         return err
@@ -263,7 +284,6 @@ func (m *VPSManager) CreateVPS(name string) (*VPS, error) {
 
     log.Printf("Starting VPS creation process for: %s", name)
 
-    // Generate password first and store it in the VPS struct
     password, err := generatePassword()
     if err != nil {
         return nil, fmt.Errorf("failed to generate password: %v", err)
@@ -274,11 +294,13 @@ func (m *VPSManager) CreateVPS(name string) (*VPS, error) {
         Name:        name,
         Status:      "creating",
         VNCPort:     m.nextVNCPort,
+        SSHPort:     m.nextSSHPort,  // Assign SSH port
         CreatedAt:   time.Now(),
         ExpiresAt:   time.Now().Add(VPS_LIFETIME),
-        Password:    password,  // Use the generated password
+        Password:    password,
     }
     m.nextVNCPort++
+    m.nextSSHPort++
 
     instanceDir := filepath.Join(m.baseDir, "disks", vps.ID)
     if err := os.MkdirAll(instanceDir, 0755); err != nil {
@@ -300,7 +322,6 @@ func (m *VPSManager) CreateVPS(name string) (*VPS, error) {
     }
 
     cloudInitPath := filepath.Join(instanceDir, "cloud-init.iso")
-    // Pass the VPS password to createCloudInitISO
     if err := createCloudInitISO(cloudInitPath, vps.Password); err != nil {
         os.RemoveAll(instanceDir)
         return nil, fmt.Errorf("failed to create cloud-init ISO: %v", err)
@@ -318,7 +339,10 @@ func (m *VPSManager) CreateVPS(name string) (*VPS, error) {
         "-drive", fmt.Sprintf("file=%s,format=raw", cloudInitPath),
         "-vnc", fmt.Sprintf("0.0.0.0:%d", vps.VNCPort-5900),
         "-device", "virtio-net-pci,netdev=user0",
-        "-netdev", fmt.Sprintf("user,id=user0,hostfwd=tcp::%d-:22", 10000+vps.VNCPort),
+        "-netdev", fmt.Sprintf(
+            "user,id=user0,hostfwd=tcp:0.0.0.0:%d-:22",
+            vps.SSHPort,
+        ),
         "-pidfile", pidFile,
         "-daemonize",
         "-enable-kvm",
@@ -358,6 +382,7 @@ func (m *VPSManager) CreateVPS(name string) (*VPS, error) {
         }
     }
 
+    // Verify the QEMU process is running and valid
     if err := checkProcess(pid); err != nil {
         os.RemoveAll(instanceDir)
         return nil, fmt.Errorf("QEMU process verification failed: %v", err)
@@ -373,9 +398,11 @@ func (m *VPSManager) CreateVPS(name string) (*VPS, error) {
         // Don't fail the VPS creation if websockify fails, just log the error
     }
 
+    // Schedule cleanup after lifetime expires
     go m.scheduleCleanup(vps)
 
-    log.Printf("VPS %s (ID: %s) successfully created with PID %d", vps.Name, vps.ID, vps.QEMUPid)
+    log.Printf("VPS %s (ID: %s) successfully created with PID %d, SSH port %d", 
+        vps.Name, vps.ID, vps.QEMUPid, vps.SSHPort)
     return vps, nil
 }
 
@@ -564,6 +591,49 @@ func verifySystemRequirements() error {
     return nil
 }
 
+func (m *VPSManager) cleanup() {
+    log.Println("Starting cleanup of all VPS instances...")
+    
+    m.mutex.Lock()
+    defer m.mutex.Unlock()
+
+    var wg sync.WaitGroup
+    for id, vps := range m.instances {
+        wg.Add(1)
+        go func(id string, vps *VPS) {
+            defer wg.Done()
+            
+            log.Printf("Cleaning up VPS %s (ID: %s)", vps.Name, id)
+            
+            // Stop websockify first
+            if err := stopWebsockifyProxy(vps.VNCPort); err != nil {
+                log.Printf("Warning: Failed to stop websockify for VPS %s: %v", id, err)
+            }
+
+            // Kill QEMU process
+            if vps.QEMUPid > 0 {
+                if proc, err := os.FindProcess(vps.QEMUPid); err == nil {
+                    log.Printf("Killing QEMU process %d for VPS %s", vps.QEMUPid, id)
+                    proc.Kill()
+                    proc.Wait() // Wait for the process to actually terminate
+                }
+            }
+
+            // Cleanup files
+            instanceDir := filepath.Join(m.baseDir, "disks", id)
+            if err := os.RemoveAll(instanceDir); err != nil {
+                log.Printf("Warning: Failed to remove instance directory for VPS %s: %v", id, err)
+            }
+
+            log.Printf("Successfully cleaned up VPS %s", id)
+        }(id, vps)
+    }
+
+    // Wait for all cleanup goroutines to complete
+    wg.Wait()
+    log.Println("All VPS instances have been cleaned up")
+}
+
 func main() {
     log.Printf("Verifying system requirements...")
     if err := verifySystemRequirements(); err != nil {
@@ -591,6 +661,28 @@ func main() {
     if err != nil {
         log.Fatal(err)
     }
+
+    // Set up signal handling
+    sigChan := make(chan os.Signal, 1)
+    signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+    // Run cleanup when program exits
+    go func() {
+        sig := <-sigChan
+        log.Printf("Received signal %v, starting cleanup...", sig)
+        manager.cleanup()
+        log.Println("Cleanup completed, exiting...")
+        os.Exit(0)
+    }()
+
+    // Ensure cleanup runs even on panic
+    defer func() {
+        if r := recover(); r != nil {
+            log.Printf("Panic occurred: %v", r)
+            manager.cleanup()
+            panic(r) // Re-panic after cleanup
+        }
+    }()
 
     apiMux := http.NewServeMux()
     apiMux.HandleFunc("/api/vps/create", manager.handleCreateVPS)
