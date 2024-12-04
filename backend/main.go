@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -233,7 +234,7 @@ func downloadAndPrepareBaseImage(imageType string) error {
 }
 
 
-func createCloudInitISO(path string, rootPassword string, imageType string) error {
+func createCloudInitISO(path string, rootPassword string, imageType string, hostname string) error {
     tmpDir, err := os.MkdirTemp("", "cloud-init")
     if err != nil {
         return err
@@ -258,7 +259,7 @@ bootcmd:
   - systemctl enable sshd
   - systemctl start sshd`, rootPassword)
     
-    case "fedora-38":
+    case "fedora-38", "fedora-40":
         userData = fmt.Sprintf(`#cloud-config
 users:
   - name: root
@@ -292,16 +293,18 @@ chpasswd:
 ssh_pwauth: true
 disable_root: false
 
+hostname: %s
+
 runcmd:
   - sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-  - systemctl restart ssh`, rootPassword)
+  - systemctl restart ssh`, rootPassword, hostname)
     }
 
     if err := os.WriteFile(filepath.Join(tmpDir, "user-data"), []byte(userData), 0644); err != nil {
         return err
     }
 
-    metaData := fmt.Sprintf("instance-id: 1\nlocal-hostname: %s-vps\n", imageType)
+    metaData := fmt.Sprintf("instance-id: %s\nlocal-hostname: %s\n", uuid.New().String(), hostname)
     if err := os.WriteFile(filepath.Join(tmpDir, "meta-data"), []byte(metaData), 0644); err != nil {
         return err
     }
@@ -375,15 +378,21 @@ func stopWebsockifyProxy(vncPort int) error {
     return nil
 }
 
-func (m *VPSManager) CreateVPS(name string, imageType string) (*VPS, error) {
+func (m *VPSManager) CreateVPS(name string, hostname string, imageType string) (*VPS, error) {
     m.mutex.Lock()
     defer m.mutex.Unlock()
 
-    log.Printf("Starting VPS creation process for: %s with image: %s", name, imageType)
+    log.Printf("Starting VPS creation process for: %s with image: %s and hostname: %s", 
+        name, imageType, hostname)
 
     // Validate image type
     if _, exists := SUPPORTED_IMAGES[imageType]; !exists {
         return nil, fmt.Errorf("unsupported image type: %s", imageType)
+    }
+
+    // Validate hostname format
+    if !isValidHostname(hostname) {
+        return nil, fmt.Errorf("invalid hostname format: %s", hostname)
     }
 
     // Check/prepare base image
@@ -404,6 +413,7 @@ func (m *VPSManager) CreateVPS(name string, imageType string) (*VPS, error) {
     vps := &VPS{
         ID:          uuid.New().String(),
         Name:        name,
+        Hostname:    hostname,
         Status:      "creating",
         ImageType:   imageType,
         VNCPort:     m.nextVNCPort,
@@ -421,6 +431,16 @@ func (m *VPSManager) CreateVPS(name string, imageType string) (*VPS, error) {
         return nil, fmt.Errorf("failed to create instance directory: %v", err)
     }
 
+    // Setup cleanup in case of failure
+    cleanup := func() {
+        os.RemoveAll(instanceDir)
+        if vps.QEMUPid > 0 {
+            if proc, err := os.FindProcess(vps.QEMUPid); err == nil {
+                proc.Kill()
+            }
+        }
+    }
+
     // Create disk image
     vps.ImagePath = filepath.Join(instanceDir, "disk.qcow2")
     log.Printf("Creating disk image at: %s", vps.ImagePath)
@@ -432,21 +452,21 @@ func (m *VPSManager) CreateVPS(name string, imageType string) (*VPS, error) {
         vps.ImagePath)
     
     if output, err := createDisk.CombinedOutput(); err != nil {
-        os.RemoveAll(instanceDir)
+        cleanup()
         return nil, fmt.Errorf("failed to create disk: %v, output: %s", err, string(output))
     }
 
     // Create cloud-init ISO
     cloudInitPath := filepath.Join(instanceDir, "cloud-init.iso")
-    if err := createCloudInitISO(cloudInitPath, vps.Password, imageType); err != nil {
-        os.RemoveAll(instanceDir)
+    if err := createCloudInitISO(cloudInitPath, vps.Password, imageType, hostname); err != nil {
+        cleanup()
         return nil, fmt.Errorf("failed to create cloud-init ISO: %v", err)
     }
 
     // Prepare QEMU command
     pidFile := filepath.Join(instanceDir, "qemu.pid")
+    logFile := filepath.Join(m.baseDir, "logs", fmt.Sprintf("%s.log", vps.ID))
     
-    // Build QEMU arguments based on image type
     args := []string{
         "-name", fmt.Sprintf("guest=%s,debug-threads=on", vps.Name),
         "-machine", "pc,accel=kvm,usb=off,vmport=off",
@@ -461,64 +481,63 @@ func (m *VPSManager) CreateVPS(name string, imageType string) (*VPS, error) {
             "user,id=user0,hostfwd=tcp:0.0.0.0:%d-:22",
             vps.SSHPort,
         ),
-    }
-
-    // Add image-specific arguments
-    switch imageType {
-    case "arch-linux":
-        // Arch Linux might need additional kernel parameters
-        args = append(args, "-append", "console=ttyS0 root=/dev/vda")
-    case "fedora-38":
-        // Fedora might need specific ACPI settings
-        args = append(args, "-machine", "pc,accel=kvm,usb=off,vmport=off,acpi=on")
-    }
-
-    // Add common final arguments
-    args = append(args,
         "-pidfile", pidFile,
         "-daemonize",
         "-enable-kvm",
-    )
+    }
 
     cmd := exec.Command("qemu-system-x86_64", args...)
     
     // Setup logging
-    logFile, err := os.Create(filepath.Join(m.baseDir, "logs", fmt.Sprintf("%s.log", vps.ID)))
+    cmd.Stdout, err = os.Create(logFile)
     if err != nil {
-        os.RemoveAll(instanceDir)
+        cleanup()
         return nil, fmt.Errorf("failed to create log file: %v", err)
     }
-    defer logFile.Close()
+    cmd.Stderr = cmd.Stdout
 
-    cmd.Stdout = logFile
-    cmd.Stderr = logFile
-
-    log.Printf("Starting QEMU with command: %v", cmd.Args)
-    if err := cmd.Run(); err != nil {
-        os.RemoveAll(instanceDir)
+    // Start QEMU with better error handling
+    if err := cmd.Start(); err != nil {
+        cleanup()
         return nil, fmt.Errorf("failed to start QEMU: %v", err)
     }
 
-    // Wait for PID file
-    var pid int
-    for i := 0; i < 10; i++ {
-        time.Sleep(500 * time.Millisecond)
-        pidBytes, err := os.ReadFile(pidFile)
-        if err == nil {
-            if _, err := fmt.Sscanf(string(pidBytes), "%d", &pid); err == nil {
-                break
+    // Wait for PID file with timeout
+    pid := 0
+    timeout := time.After(30 * time.Second)
+    ticker := time.NewTicker(500 * time.Millisecond)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-timeout:
+            cleanup()
+            // Read QEMU logs for better error reporting
+            logs, _ := os.ReadFile(logFile)
+            return nil, fmt.Errorf("timeout waiting for QEMU to start. Logs: %s", string(logs))
+            
+        case <-ticker.C:
+            if pidBytes, err := os.ReadFile(pidFile); err == nil {
+                if _, err := fmt.Sscanf(string(pidBytes), "%d", &pid); err == nil {
+                    goto pidFound
+                }
             }
-        }
-        if i == 9 {
-            os.RemoveAll(instanceDir)
-            return nil, fmt.Errorf("failed to get QEMU PID")
         }
     }
 
-    // Verify QEMU process
-    if err := checkProcess(pid); err != nil {
-        os.RemoveAll(instanceDir)
-        return nil, fmt.Errorf("QEMU process verification failed: %v", err)
+pidFound:
+    // Verify QEMU process with retries
+    retries := 3
+    for i := 0; i < retries; i++ {
+        if err := checkProcess(pid); err == nil {
+            break
+        }
+        if i == retries-1 {
+            cleanup()
+            logs, _ := os.ReadFile(logFile)
+            return nil, fmt.Errorf("QEMU process verification failed after %d retries. Logs: %s", retries, string(logs))
+        }
+        time.Sleep(time.Second)
     }
 
     vps.QEMUPid = pid
@@ -537,6 +556,26 @@ func (m *VPSManager) CreateVPS(name string, imageType string) (*VPS, error) {
         vps.Name, vps.ID, vps.QEMUPid, imageType)
     return vps, nil
 }
+
+// Add hostname validation function
+func isValidHostname(hostname string) bool {
+    if len(hostname) > 253 {
+        return false
+    }
+    
+    parts := strings.Split(hostname, ".")
+    for _, part := range parts {
+        if len(part) > 63 {
+            return false
+        }
+        if !regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$`).MatchString(part) {
+            return false
+        }
+    }
+    
+    return true
+}
+
 
 func (m *VPSManager) scheduleCleanup(vps *VPS) {
     time.Sleep(VPS_LIFETIME)
@@ -615,6 +654,7 @@ func (m *VPSManager) handleCreateVPS(w http.ResponseWriter, r *http.Request) {
 
     var req struct {
         Name      string `json:"name"`
+        Hostname  string `json:"hostname"`
         ImageType string `json:"image_type"`
     }
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -626,7 +666,11 @@ func (m *VPSManager) handleCreateVPS(w http.ResponseWriter, r *http.Request) {
         req.ImageType = "ubuntu-22.04" // Default to Ubuntu if not specified
     }
 
-    vps, err := m.CreateVPS(req.Name, req.ImageType)
+    if req.Hostname == "" {
+        req.Hostname = req.Name + ".vps.local" // Default hostname if not specified
+    }
+
+    vps, err := m.CreateVPS(req.Name, req.Hostname, req.ImageType)
     if err != nil {
         http.Error(w, err.Error(), http.StatusInternalServerError)
         return

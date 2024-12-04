@@ -13,7 +13,6 @@ function calculateTimeRemaining(expiresAt: string): string {
 
 function sanitizeVPSData(vps: VPSBackend): VPSPublic {
   return {
-    id: vps.id,
     name: vps.name,
     status: vps.status,
     image_type: vps.image_type,
