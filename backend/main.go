@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -31,7 +32,9 @@ const (
     DISK_SIZE       = 50    // 50GB
     DOWNLOAD_SPEED  = 50    // 50Mbps
     UPLOAD_SPEED    = 15    // 15Mbps
+    SSH_PORT_START  = 2200  // Starting port for SSH forwarding
 )
+
 var SUPPORTED_IMAGES = map[string]string{
     "ubuntu-22.04": UBUNTU_IMAGE_URL,
     "debian-11":    DEBIAN_IMAGE_URL,
@@ -39,13 +42,15 @@ var SUPPORTED_IMAGES = map[string]string{
     "arch-linux":   ARCH_IMAGE_URL,
 }
 
+// Update the VPS struct to include ImageType
 type VPS struct {
     ID          string    `json:"id"`
     Name        string    `json:"name"`
     Status      string    `json:"status"`
-    ImageType   string    `json:"image_type"`
+    ImageType   string    `json:"image_type"`  // Add this field
     QEMUPid     int       `json:"qemu_pid,omitempty"`
     VNCPort     int       `json:"vnc_port"`
+    SSHPort     int       `json:"ssh_port"`
     CreatedAt   time.Time `json:"created_at"`
     ExpiresAt   time.Time `json:"expires_at"`
     ImagePath   string    `json:"image_path"`
@@ -53,16 +58,18 @@ type VPS struct {
 }
 
 type VPSManager struct {
-    instances   map[string]*VPS
-    mutex       sync.RWMutex
-    nextVNCPort int
-    baseDir     string
+    instances    map[string]*VPS
+    mutex        sync.RWMutex
+    nextVNCPort  int
+    nextSSHPort  int       // Added to track SSH ports
+    baseDir      string
 }
 
 
 func getBaseImagePath(imageType string) string {
     return filepath.Join(BASE_DIR, imageType + ".qcow2")
 }
+
 
 func checkProcess(pid int) error {
     proc, err := os.FindProcess(pid)
@@ -115,11 +122,13 @@ func NewVPSManager(baseDir string) (*VPSManager, error) {
     }
 
     return &VPSManager{
-        instances:   make(map[string]*VPS),
-        nextVNCPort: 5900,
-        baseDir:     baseDir,
+        instances:    make(map[string]*VPS),
+        nextVNCPort:  5900,
+        nextSSHPort:  SSH_PORT_START,
+        baseDir:      baseDir,
     }, nil
 }
+
 
 func downloadAndPrepareBaseImage(imageType string) error {
     imageURL, exists := SUPPORTED_IMAGES[imageType]
@@ -239,6 +248,7 @@ chpasswd:
 
 ssh_pwauth: true
 disable_root: false
+
 runcmd:
   - sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
   - systemctl restart ssh`, rootPassword)
@@ -262,6 +272,8 @@ runcmd:
 
     return nil
 }
+
+
 func startWebsockifyProxy(vncPort int) error {
     // Calculate websocket port (6900 + offset)
     wsPort := vncPort + 1000  // So 5900 -> 6900, 5901 -> 6901, etc.
@@ -352,11 +364,13 @@ func (m *VPSManager) CreateVPS(name string, imageType string) (*VPS, error) {
         Status:      "creating",
         ImageType:   imageType,
         VNCPort:     m.nextVNCPort,
+        SSHPort:     m.nextSSHPort,
         CreatedAt:   time.Now(),
         ExpiresAt:   time.Now().Add(VPS_LIFETIME),
         Password:    password,
     }
     m.nextVNCPort++
+    m.nextSSHPort++
 
     // Create instance directory
     instanceDir := filepath.Join(m.baseDir, "disks", vps.ID)
@@ -400,7 +414,10 @@ func (m *VPSManager) CreateVPS(name string, imageType string) (*VPS, error) {
         "-drive", fmt.Sprintf("file=%s,format=raw", cloudInitPath),
         "-vnc", fmt.Sprintf("0.0.0.0:%d", vps.VNCPort-5900),
         "-device", "virtio-net-pci,netdev=user0",
-        "-netdev", fmt.Sprintf("user,id=user0,hostfwd=tcp::%d-:22", 10000+vps.VNCPort),
+        "-netdev", fmt.Sprintf(
+            "user,id=user0,hostfwd=tcp:0.0.0.0:%d-:22",
+            vps.SSHPort,
+        ),
     }
 
     // Add image-specific arguments
@@ -420,7 +437,6 @@ func (m *VPSManager) CreateVPS(name string, imageType string) (*VPS, error) {
         "-enable-kvm",
     )
 
-    // Create QEMU command
     cmd := exec.Command("qemu-system-x86_64", args...)
     
     // Setup logging
@@ -434,8 +450,7 @@ func (m *VPSManager) CreateVPS(name string, imageType string) (*VPS, error) {
     cmd.Stdout = logFile
     cmd.Stderr = logFile
 
-    // Start QEMU
-    log.Printf("Starting QEMU for %s with command: %v", imageType, cmd.Args)
+    log.Printf("Starting QEMU with command: %v", cmd.Args)
     if err := cmd.Run(); err != nil {
         os.RemoveAll(instanceDir)
         return nil, fmt.Errorf("failed to start QEMU: %v", err)
@@ -463,7 +478,6 @@ func (m *VPSManager) CreateVPS(name string, imageType string) (*VPS, error) {
         return nil, fmt.Errorf("QEMU process verification failed: %v", err)
     }
 
-    // Update VPS status
     vps.QEMUPid = pid
     vps.Status = "running"
     m.instances[vps.ID] = vps
@@ -471,44 +485,14 @@ func (m *VPSManager) CreateVPS(name string, imageType string) (*VPS, error) {
     // Start websockify proxy for VNC access
     if err := startWebsockifyProxy(vps.VNCPort); err != nil {
         log.Printf("Warning: Failed to start websockify proxy: %v", err)
-        // Don't fail the VPS creation if websockify fails, just log the error
     }
 
     // Schedule cleanup
     go m.scheduleCleanup(vps)
 
-    // Apply resource limits if needed
-    if err := m.applyResourceLimits(vps); err != nil {
-        log.Printf("Warning: Failed to apply resource limits: %v", err)
-    }
-
     log.Printf("VPS %s (ID: %s) successfully created with PID %d using image %s", 
         vps.Name, vps.ID, vps.QEMUPid, imageType)
     return vps, nil
-}
-
-// Helper function to apply resource limits
-func (m *VPSManager) applyResourceLimits(vps *VPS) error {
-    // Apply network bandwidth limits using tc
-    uploadLimit := fmt.Sprintf("%dMbit", UPLOAD_SPEED)
-    downloadLimit := fmt.Sprintf("%dMbit", DOWNLOAD_SPEED)
-
-    cmds := []struct {
-        name string
-        args []string
-    }{
-        {"tc", []string{"qdisc", "add", "dev", "eth0", "root", "handle", "1:", "htb"}},
-        {"tc", []string{"class", "add", "dev", "eth0", "parent", "1:", "classid", "1:1", "htb", "rate", uploadLimit}},
-        {"tc", []string{"class", "add", "dev", "eth0", "parent", "1:", "classid", "1:2", "htb", "rate", downloadLimit}},
-    }
-
-    for _, cmd := range cmds {
-        if output, err := exec.Command(cmd.name, cmd.args...).CombinedOutput(); err != nil {
-            return fmt.Errorf("failed to run %s: %v, output: %s", cmd.name, err, string(output))
-        }
-    }
-
-    return nil
 }
 
 func (m *VPSManager) scheduleCleanup(vps *VPS) {
@@ -543,21 +527,6 @@ func (m *VPSManager) DeleteVPS(id string) error {
 
     delete(m.instances, id)
     return nil
-}
-
-func (m *VPSManager) handleListImages(w http.ResponseWriter, r *http.Request) {
-    if r.Method != http.MethodGet {
-        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-        return
-    }
-
-    images := make([]string, 0, len(SUPPORTED_IMAGES))
-    for imageType := range SUPPORTED_IMAGES {
-        images = append(images, imageType)
-    }
-
-    w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(images)
 }
 
 func (m *VPSManager) GetVPS(id string) (*VPS, error) {
@@ -623,6 +592,7 @@ func (m *VPSManager) handleCreateVPS(w http.ResponseWriter, r *http.Request) {
     json.NewEncoder(w).Encode(vps)
 }
 
+
 func (m *VPSManager) handleListVPS(w http.ResponseWriter, r *http.Request) {
     if r.Method != http.MethodGet {
         http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -666,6 +636,22 @@ func (m *VPSManager) handleDeleteVPS(w http.ResponseWriter, r *http.Request) {
 
     w.WriteHeader(http.StatusOK)
 }
+
+func (m *VPSManager) handleListImages(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodGet {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    images := make([]string, 0, len(SUPPORTED_IMAGES))
+    for imageType := range SUPPORTED_IMAGES {
+        images = append(images, imageType)
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(images)
+}
+
 
 type AuthMiddleware struct {
     apiKey string
@@ -716,6 +702,49 @@ func verifySystemRequirements() error {
     return nil
 }
 
+func (m *VPSManager) cleanup() {
+    log.Println("Starting cleanup of all VPS instances...")
+    
+    m.mutex.Lock()
+    defer m.mutex.Unlock()
+
+    var wg sync.WaitGroup
+    for id, vps := range m.instances {
+        wg.Add(1)
+        go func(id string, vps *VPS) {
+            defer wg.Done()
+            
+            log.Printf("Cleaning up VPS %s (ID: %s)", vps.Name, id)
+            
+            // Stop websockify first
+            if err := stopWebsockifyProxy(vps.VNCPort); err != nil {
+                log.Printf("Warning: Failed to stop websockify for VPS %s: %v", id, err)
+            }
+
+            // Kill QEMU process
+            if vps.QEMUPid > 0 {
+                if proc, err := os.FindProcess(vps.QEMUPid); err == nil {
+                    log.Printf("Killing QEMU process %d for VPS %s", vps.QEMUPid, id)
+                    proc.Kill()
+                    proc.Wait() // Wait for the process to actually terminate
+                }
+            }
+
+            // Cleanup files
+            instanceDir := filepath.Join(m.baseDir, "disks", id)
+            if err := os.RemoveAll(instanceDir); err != nil {
+                log.Printf("Warning: Failed to remove instance directory for VPS %s: %v", id, err)
+            }
+
+            log.Printf("Successfully cleaned up VPS %s", id)
+        }(id, vps)
+    }
+
+    // Wait for all cleanup goroutines to complete
+    wg.Wait()
+    log.Println("All VPS instances have been cleaned up")
+}
+
 func main() {
     log.Printf("Verifying system requirements...")
     if err := verifySystemRequirements(); err != nil {
@@ -743,6 +772,28 @@ func main() {
     if err != nil {
         log.Fatal(err)
     }
+
+    // Set up signal handling
+    sigChan := make(chan os.Signal, 1)
+    signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+    // Run cleanup when program exits
+    go func() {
+        sig := <-sigChan
+        log.Printf("Received signal %v, starting cleanup...", sig)
+        manager.cleanup()
+        log.Println("Cleanup completed, exiting...")
+        os.Exit(0)
+    }()
+
+    // Ensure cleanup runs even on panic
+    defer func() {
+        if r := recover(); r != nil {
+            log.Printf("Panic occurred: %v", r)
+            manager.cleanup()
+            panic(r) // Re-panic after cleanup
+        }
+    }()
 
     apiMux := http.NewServeMux()
     apiMux.HandleFunc("/api/vps/create", manager.handleCreateVPS)
