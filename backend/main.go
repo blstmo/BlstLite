@@ -119,6 +119,7 @@ type VPS struct {
 
 type VPSManager struct {
     instances    map[string]*VPS
+    ipInstances  map[string]string  // maps IP -> VPS ID
     mutex        sync.RWMutex
     nextVNCPort  int
     nextSSHPort  int
@@ -189,19 +190,40 @@ func NewVPSManager(baseDir string) (*VPSManager, error) {
         }
     }
 
+
     manager := &VPSManager{
         instances:     make(map[string]*VPS),
+        ipInstances:   make(map[string]string),
         nextVNCPort:   5900,
         nextSSHPort:   SSH_PORT_START,
         baseDir:       baseDir,
         metricsCache:  make(map[string]*MetricsCache),
     }
 
+
     // Start metrics collection routine
     go manager.metricsCollector()
     
     return manager, nil
 }
+
+
+func (m *VPSManager) hasVPSForIP(ip string) (bool, string) {
+    m.mutex.RLock()
+    defer m.mutex.RUnlock()
+    
+    if vpsID, exists := m.ipInstances[ip]; exists {
+        if vps, ok := m.instances[vpsID]; ok {
+            // Check if VPS has expired
+            if time.Now().After(vps.ExpiresAt) {
+                return false, ""
+            }
+            return true, vpsID
+        }
+    }
+    return false, ""
+}
+
 
 func downloadAndPrepareBaseImage(imageType string) error {
     imageURL, exists := SUPPORTED_IMAGES[imageType]
@@ -949,6 +971,14 @@ func (m *VPSManager) DeleteVPS(id string) error {
         return fmt.Errorf("VPS not found")
     }
 
+    // Remove IP association
+    for ip, vpsID := range m.ipInstances {
+        if vpsID == id {
+            delete(m.ipInstances, ip)
+            break
+        }
+    }
+
     if err := stopWebsockifyProxy(vps.VNCPort); err != nil {
         log.Printf("Warning: Failed to stop websockify: %v", err)
     }
@@ -1007,6 +1037,26 @@ func (m *VPSManager) handleCreateVPS(w http.ResponseWriter, r *http.Request) {
         return
     }
 
+    // Get client IP
+    ip := r.Header.Get("X-Real-IP")
+    if ip == "" {
+        ip = r.Header.Get("X-Forwarded-For")
+    }
+    if ip == "" {
+        ip = r.RemoteAddr
+    }
+    
+    // Clean the IP address if it includes a port
+    if host, _, err := net.SplitHostPort(ip); err == nil {
+        ip = host
+    }
+
+    // Check if IP already has a VPS
+    if hasVPS, existingID := m.hasVPSForIP(ip); hasVPS {
+        http.Error(w, fmt.Sprintf("IP already has an active VPS (ID: %s)", existingID), http.StatusConflict)
+        return
+    }
+
     var req struct {
         Name      string `json:"name"`
         Hostname  string `json:"hostname"`
@@ -1030,6 +1080,11 @@ func (m *VPSManager) handleCreateVPS(w http.ResponseWriter, r *http.Request) {
         http.Error(w, err.Error(), http.StatusInternalServerError)
         return
     }
+
+    // Associate the IP with the new VPS
+    m.mutex.Lock()
+    m.ipInstances[ip] = vps.ID
+    m.mutex.Unlock()
 
     json.NewEncoder(w).Encode(vps)
 }

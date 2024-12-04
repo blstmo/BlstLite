@@ -58,23 +58,27 @@ export async function getVPSList(): Promise<VPS[]> {
   }
   
 
-export async function createVPS(params: CreateVPSParams) {
-  const response = await fetch(`${API_CONFIG.baseUrl}/api/vps/create`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-API-Key': API_CONFIG.apiKey!
-    },
-    body: JSON.stringify(params),
-  });
-
-  if (!response.ok) {
-    const data = await response.json();
-    throw new Error(data.error || 'Failed to create VPS');
+  export async function createVPS(params: CreateVPSParams) {
+    const response = await fetch(`${API_CONFIG.baseUrl}/api/vps/create`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-Key': API_CONFIG.apiKey!
+      },
+      body: JSON.stringify(params),
+    });
+  
+    if (!response.ok) {
+      if (response.status === 409) {
+        throw new Error('You already have an active VPS. Only one VPS per IP address is allowed.');
+      }
+      const data = await response.json();
+      throw new Error(data.error || 'Failed to create VPS');
+    }
+  
+    return response.json();
   }
-
-  return response.json();
-}
+  
 
 export async function checkVPSProgress(id: string) {
   const response = await fetch(`${API_CONFIG.baseUrl}/api/vps/progress?id=${id}`, {
@@ -184,30 +188,4 @@ export async function restartVPS(id: string) {
     return response.json();
   }
   
-  // Helper functions for data formatting
-  export const formatBytes = (bytes: number, decimals = 2) => {
-    if (bytes === 0) return '0 B';
-    const k = 1024;
-    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return `${parseFloat((bytes / Math.pow(k, i)).toFixed(decimals))} ${sizes[i]}`;
-  };
-  
-  export const formatBitrate = (bytesPerSecond: number) => {
-    const bitsPerSecond = bytesPerSecond * 8;
-    if (bitsPerSecond < 1000000) {
-      return `${(bitsPerSecond / 1000).toFixed(1)} Kbps`;
-    }
-    return `${(bitsPerSecond / 1000000).toFixed(1)} Mbps`;
-  };
-  
-  export const formatPercentage = (value: number) => {
-    return `${value.toFixed(1)}%`;
-  };
-  
-  export const formatOps = (ops: number) => {
-    if (ops < 1000) {
-      return `${ops.toFixed(1)} IOPS`;
-    }
-    return `${(ops / 1000).toFixed(1)}K IOPS`;
-  };
+

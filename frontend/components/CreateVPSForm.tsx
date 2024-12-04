@@ -198,7 +198,16 @@ export default function CreateVPSForm({ onSuccess }: CreateVPSFormProps) {
       setVpsId(data.id);
     } catch (err) {
       setLoading(false);
-      setError(err instanceof Error ? err.message : 'Failed to create VPS');
+      const errorMessage = err instanceof Error ? err.message : 'Failed to create VPS';
+      setError(errorMessage);
+      
+      // If it's an IP limit error, show a more detailed message
+      if (errorMessage.includes('already have an active VPS')) {
+        setError(
+          'You already have an active VPS. Only one VPS per IP address is allowed. ' +
+          'Please delete your existing VPS before creating a new one.'
+        );
+      }
     }
   };
 
