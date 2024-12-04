@@ -21,11 +21,33 @@ import (
 )
 
 const (
-    UBUNTU_IMAGE_URL = "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img"
-    DEBIAN_IMAGE_URL = "https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-generic-amd64.qcow2"
-    FEDORA_IMAGE_URL = "https://download.fedoraproject.org/pub/fedora/linux/releases/38/Cloud/x86_64/images/Fedora-Cloud-Base-38-1.6.x86_64.qcow2"
-    ARCH_IMAGE_URL   = "https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2"
+    // Ubuntu Images
+    UBUNTU_22_04_IMAGE_URL = "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img"
+    UBUNTU_20_04_IMAGE_URL = "https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img"
+    UBUNTU_24_04_IMAGE_URL = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
     
+    // Debian Images
+    DEBIAN_11_IMAGE_URL = "https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-generic-amd64.qcow2"
+    DEBIAN_12_IMAGE_URL = "https://os-cdn.virtfusion.net/debian/debian-12-x86_64.qcow2"
+    
+    // Fedora Images
+    FEDORA_38_IMAGE_URL = "https://download.fedoraproject.org/pub/fedora/linux/releases/38/Cloud/x86_64/images/Fedora-Cloud-Base-38-1.6.x86_64.qcow2"
+    FEDORA_40_IMAGE_URL = "https://os-cdn.virtfusion.net/fedora/fedora-40-x86_64-virtfusion.qcow2"
+    
+    // RHEL-based Images
+    ALMA_8_IMAGE_URL = "https://repo.almalinux.org/almalinux/8/cloud/x86_64/images/AlmaLinux-8-GenericCloud-latest.x86_64.qcow2"
+    ALMA_9_IMAGE_URL = "https://os-cdn.virtfusion.net/alma/almalinux-9-x86_64.qcow2"
+    ROCKY_8_IMAGE_URL = "https://os.virtfusion.net/images/rocky-linux-8-minimal-x86_64.qcow2"
+    ROCKY_9_IMAGE_URL = "https://os-cdn.virtfusion.net/rocky/rocky-linux-9-x86_64.qcow2"
+    
+    // CentOS Images
+    CENTOS_7_IMAGE_URL = "https://os.virtfusion.net/images/centos-7-minimal-x86_64.qcow2"
+    CENTOS_9_IMAGE_URL = "https://os-cdn.virtfusion.net/centos/centos-stream-9-x86_64.qcow2"
+    
+    // Arch Linux
+   // ARCH_IMAGE_URL = "https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2"
+    
+    // Other constants remain the same
     BASE_DIR        = "/var/lib/vps-service/base"
     VPS_LIFETIME    = 15 * time.Minute
     RAM_SIZE        = 4096  // 4GB
@@ -36,18 +58,39 @@ const (
 )
 
 var SUPPORTED_IMAGES = map[string]string{
-    "ubuntu-22.04": UBUNTU_IMAGE_URL,
-    "debian-11":    DEBIAN_IMAGE_URL,
-    "fedora-38":    FEDORA_IMAGE_URL,
-    "arch-linux":   ARCH_IMAGE_URL,
+    // Ubuntu
+    "ubuntu-22.04": UBUNTU_22_04_IMAGE_URL,
+    "ubuntu-20.04": UBUNTU_20_04_IMAGE_URL,
+    "ubuntu-24.04": UBUNTU_24_04_IMAGE_URL,
+    
+    // Debian
+    "debian-11": DEBIAN_11_IMAGE_URL,
+    "debian-12": DEBIAN_12_IMAGE_URL,
+    
+    // Fedora
+    "fedora-38": FEDORA_38_IMAGE_URL,
+    "fedora-40": FEDORA_40_IMAGE_URL,
+    
+    // RHEL-based
+    "almalinux-8": ALMA_8_IMAGE_URL,
+    "almalinux-9": ALMA_9_IMAGE_URL,
+    "rocky-8": ROCKY_8_IMAGE_URL,
+    "rocky-9": ROCKY_9_IMAGE_URL,
+    
+    // CentOS
+    "centos-7": CENTOS_7_IMAGE_URL,
+    "centos-9": CENTOS_9_IMAGE_URL,
+    
+    // Arch Linux
+    //"arch-linux": ARCH_IMAGE_URL,
 }
-
 // Update the VPS struct to include ImageType
 type VPS struct {
     ID          string    `json:"id"`
     Name        string    `json:"name"`
+    Hostname    string    `json:"hostname"`    // Add hostname field
     Status      string    `json:"status"`
-    ImageType   string    `json:"image_type"`  // Add this field
+    ImageType   string    `json:"image_type"`
     QEMUPid     int       `json:"qemu_pid,omitempty"`
     VNCPort     int       `json:"vnc_port"`
     SSHPort     int       `json:"ssh_port"`
