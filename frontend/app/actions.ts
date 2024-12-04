@@ -101,3 +101,51 @@ export async function getAvailableImages() {
 
   return response.json();
 }
+export async function startVPS(id: string) {
+    const response = await fetch(`${API_CONFIG.baseUrl}/api/vps/start?id=${id}`, {
+      method: 'POST',
+      headers: {
+        'X-API-Key': API_CONFIG.apiKey!
+      }
+    });
+  
+    if (!response.ok) {
+      const data = await response.json();
+      throw new Error(data.error || 'Failed to start VPS');
+    }
+  
+    return response.ok;
+  }
+  
+  export async function stopVPS(id: string) {
+    const response = await fetch(`${API_CONFIG.baseUrl}/api/vps/stop?id=${id}`, {
+      method: 'POST',
+      headers: {
+        'X-API-Key': API_CONFIG.apiKey!
+      }
+    });
+  
+    if (!response.ok) {
+      const data = await response.json();
+      throw new Error(data.error || 'Failed to stop VPS');
+    }
+  
+    return response.ok;
+  }
+  
+
+export async function restartVPS(id: string) {
+    const response = await fetch(`${API_CONFIG.baseUrl}/api/vps/restart?id=${id}`, {
+      method: 'POST',
+      headers: {
+        'X-API-Key': API_CONFIG.apiKey!
+      }
+    });
+  
+    if (!response.ok) {
+      const data = await response.json();
+      throw new Error(data.error || 'Failed to restart VPS');
+    }
+  
+    return response.ok;
+  }

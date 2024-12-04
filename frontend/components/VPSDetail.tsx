@@ -14,22 +14,47 @@ import {
   Network,
   Globe,
   Copy,
-  AlertTriangle
+  AlertTriangle,
+  RefreshCcw,
+  Loader2,
+  Play,
+  Square
 } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { CountdownTimer } from '@/components/countdown-timer';
+import { restartVPS, startVPS, stopVPS, getVPSDetails } from '@/app/actions';
 
 interface VPSDetailProps {
   vps: VPSBackend;
   onClose: () => void;
 }
 
-export default function VPSDetail({ vps, onClose }: VPSDetailProps) {
+export default function VPSDetail({ vps: initialVPS, onClose }: VPSDetailProps) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const backendUrl = process.env.NEXT_PUBLIC_API_URL;
   const backendHost = backendUrl ? backendUrl.split('//')[1].split(':')[0] : '';
   const [copyAlert, setCopyAlert] = useState<string | null>(null);
+  const [isRestarting, setIsRestarting] = useState(false);
+  const [isStarting, setIsStarting] = useState(false);
+  const [isStopping, setIsStopping] = useState(false);
+  const [vps, setVPS] = useState<VPSBackend>(initialVPS);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const pollInterval = setInterval(async () => {
+      try {
+        const updatedVPS = await getVPSDetails(vps.id);
+        setVPS(updatedVPS);
+        setError(null);
+      } catch (err) {
+        console.error('Failed to fetch VPS status:', err);
+        setError('Failed to update VPS status');
+      }
+    }, 5000);
+
+    return () => clearInterval(pollInterval);
+  }, [vps.id]);
 
   useEffect(() => {
     if (!backendUrl) {
@@ -48,12 +73,12 @@ export default function VPSDetail({ vps, onClose }: VPSDetailProps) {
       reconnect: 'true',
     });
 
-    if (iframeRef.current) {
+    if (iframeRef.current && vps.status === 'running') {
       const novncUrl = `${backendUrl}/novnc/vnc.html?${vncParams.toString()}`;
       console.log('Connecting to VNC:', novncUrl);
       iframeRef.current.src = novncUrl;
     }
-  }, [vps, backendUrl, backendHost]);
+  }, [vps.status, vps.vnc_port, backendUrl, backendHost]);
 
   useEffect(() => {
     if (copyAlert) {
@@ -70,6 +95,48 @@ export default function VPSDetail({ vps, onClose }: VPSDetailProps) {
     });
   };
 
+  const handleRestart = async () => {
+    try {
+      setIsRestarting(true);
+      setError(null);
+      await restartVPS(vps.id);
+      setCopyAlert('VPS restart initiated');
+    } catch (error) {
+      console.error('Failed to restart VPS:', error);
+      setError('Failed to restart VPS');
+    } finally {
+      setIsRestarting(false);
+    }
+  };
+
+  const handleStart = async () => {
+    try {
+      setIsStarting(true);
+      setError(null);
+      await startVPS(vps.id);
+      setCopyAlert('VPS start initiated');
+    } catch (error) {
+      console.error('Failed to start VPS:', error);
+      setError('Failed to start VPS');
+    } finally {
+      setIsStarting(false);
+    }
+  };
+
+  const handleStop = async () => {
+    try {
+      setIsStopping(true);
+      setError(null);
+      await stopVPS(vps.id);
+      setCopyAlert('VPS stop initiated');
+    } catch (error) {
+      console.error('Failed to stop VPS:', error);
+      setError('Failed to stop VPS');
+    } finally {
+      setIsStopping(false);
+    }
+  };
+
   const sshCommand = `ssh root@${backendHost} -p ${vps.ssh_port}`;
 
   const getStatusColor = (status: string) => {
@@ -79,7 +146,11 @@ export default function VPSDetail({ vps, onClose }: VPSDetailProps) {
       case 'creating':
         return 'warning';
       case 'stopped':
+      case 'stopping':
         return 'destructive';
+      case 'starting':
+      case 'restarting':
+        return 'warning';
       case 'failed':
         return 'destructive';
       default:
@@ -95,6 +166,14 @@ export default function VPSDetail({ vps, onClose }: VPSDetailProps) {
         </div>
       )}
 
+      {error && (
+        <Alert variant="destructive">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertTitle>Error</AlertTitle>
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
+
       <div className="flex justify-between items-center">
         <div className="space-y-2">
           <h2 className="text-3xl font-bold tracking-tight">{vps.name}</h2>
@@ -107,10 +186,60 @@ export default function VPSDetail({ vps, onClose }: VPSDetailProps) {
             </span>
           </div>
         </div>
-        <Button variant="outline" onClick={onClose} className="flex items-center gap-2">
-          <ArrowLeft className="h-4 w-4" />
-          Back to List
-        </Button>
+        <div className="flex items-center gap-2">
+          {vps.status === 'stopped' && (
+            <Button
+              variant="outline"
+              onClick={handleStart}
+              disabled={isStarting}
+              className="flex items-center gap-2"
+            >
+              {isStarting ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Play className="h-4 w-4" />
+              )}
+              {isStarting ? 'Starting...' : 'Start'}
+            </Button>
+          )}
+          
+          {vps.status === 'running' && (
+            <>
+              <Button
+                variant="outline"
+                onClick={handleStop}
+                disabled={isStopping}
+                className="flex items-center gap-2"
+              >
+                {isStopping ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Square className="h-4 w-4" />
+                )}
+                {isStopping ? 'Stopping...' : 'Stop'}
+              </Button>
+              
+              <Button
+                variant="outline"
+                onClick={handleRestart}
+                disabled={isRestarting}
+                className="flex items-center gap-2"
+              >
+                {isRestarting ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <RefreshCcw className="h-4 w-4" />
+                )}
+                {isRestarting ? 'Restarting...' : 'Restart'}
+              </Button>
+            </>
+          )}
+          
+          <Button variant="outline" onClick={onClose} className="flex items-center gap-2">
+            <ArrowLeft className="h-4 w-4" />
+            Back to List
+          </Button>
+        </div>
       </div>
 
       {vps.status === 'failed' && (

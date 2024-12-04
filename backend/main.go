@@ -62,6 +62,11 @@ const (
     DOWNLOAD_SPEED  = 50    // 50Mbps
     UPLOAD_SPEED    = 15    // 15Mbps
     SSH_PORT_START  = 2200  // Starting port for SSH forwarding
+    StatusRunning    = "running"
+    StatusStopped    = "stopped"
+    StatusStarting   = "starting"
+    StatusStopping   = "stopping"
+    StatusRestarting = "restarting"
 )
 
 var SUPPORTED_IMAGES = map[string]string{
@@ -491,6 +496,7 @@ func (m *VPSManager) createVPSWithProgress(vps *VPS) error {
         "-drive", fmt.Sprintf("file=%s,format=raw", cloudInitPath),
         "-vnc", fmt.Sprintf("0.0.0.0:%d", vps.VNCPort-5900),
         "-device", "virtio-net-pci,netdev=user0",
+        "-monitor", fmt.Sprintf("unix:%s,server,nowait", filepath.Join(instanceDir, "qemu-monitor.sock")),
         "-netdev", fmt.Sprintf(
             "user,id=user0,hostfwd=tcp:0.0.0.0:%d-:22",
             vps.SSHPort,
@@ -585,6 +591,324 @@ func isValidHostname(hostname string) bool {
     }
     
     return true
+}
+
+
+func (m *VPSManager) StopVPS(id string) error {
+    m.mutex.Lock()
+    defer m.mutex.Unlock()
+
+    vps, exists := m.instances[id]
+    if !exists {
+        return fmt.Errorf("VPS not found")
+    }
+
+    if vps.Status == StatusStopped {
+        return fmt.Errorf("VPS is already stopped")
+    }
+
+    if vps.QEMUPid <= 0 {
+        return fmt.Errorf("VPS does not have a valid PID")
+    }
+
+    // Get the QEMU monitor socket path
+    instanceDir := filepath.Join(m.baseDir, "disks", vps.ID)
+    monitorSocket := filepath.Join(instanceDir, "qemu-monitor.sock")
+
+    // Create a temporary file for command output
+    tmpFile, err := os.CreateTemp("", "qemu-command-*")
+    if err != nil {
+        return fmt.Errorf("failed to create temp file: %v", err)
+    }
+    defer os.Remove(tmpFile.Name())
+
+    // Send system_powerdown command to QEMU monitor
+    cmd := exec.Command("echo", "system_powerdown")
+    socat := exec.Command("socat", "-", fmt.Sprintf("UNIX-CONNECT:%s", monitorSocket))
+    
+    // Connect the commands
+    socatIn, err := socat.StdinPipe()
+    if err != nil {
+        return fmt.Errorf("failed to create pipe: %v", err)
+    }
+    
+    cmd.Stdout = socatIn
+    socat.Stdout = tmpFile
+    socat.Stderr = tmpFile
+
+    // Start socat first
+    if err := socat.Start(); err != nil {
+        return fmt.Errorf("failed to start socat: %v", err)
+    }
+
+    // Run the echo command
+    if err := cmd.Run(); err != nil {
+        return fmt.Errorf("failed to send command: %v", err)
+    }
+
+    // Close stdin pipe
+    socatIn.Close()
+
+    // Wait for socat to finish
+    if err := socat.Wait(); err != nil {
+        output, _ := os.ReadFile(tmpFile.Name())
+        return fmt.Errorf("failed to execute command: %v, output: %s", err, string(output))
+    }
+
+    vps.Status = StatusStopping
+
+    // Wait for shutdown to complete
+    go func() {
+        timeout := time.After(2 * time.Minute)
+        ticker := time.NewTicker(5 * time.Second)
+        defer ticker.Stop()
+
+        for {
+            select {
+            case <-timeout:
+                // Force stop if graceful shutdown fails
+                if proc, err := os.FindProcess(vps.QEMUPid); err == nil {
+                    proc.Kill()
+                }
+                m.mutex.Lock()
+                vps.Status = StatusStopped
+                m.mutex.Unlock()
+                return
+                
+            case <-ticker.C:
+                if err := checkProcess(vps.QEMUPid); err != nil {
+                    m.mutex.Lock()
+                    vps.Status = StatusStopped
+                    m.mutex.Unlock()
+                    return
+                }
+            }
+        }
+    }()
+
+    return nil
+}
+
+func (m *VPSManager) StartVPS(id string) error {
+    m.mutex.Lock()
+    defer m.mutex.Unlock()
+
+    vps, exists := m.instances[id]
+    if !exists {
+        return fmt.Errorf("VPS not found")
+    }
+
+    if vps.Status == StatusRunning {
+        return fmt.Errorf("VPS is already running")
+    }
+
+    instanceDir := filepath.Join(m.baseDir, "disks", vps.ID)
+    pidFile := filepath.Join(instanceDir, "qemu.pid")
+    logFile := filepath.Join(m.baseDir, "logs", fmt.Sprintf("%s.log", vps.ID))
+    cloudInitPath := filepath.Join(instanceDir, "cloud-init.iso")
+    monitorSocket := filepath.Join(instanceDir, "qemu-monitor.sock")
+
+    // Remove existing monitor socket if it exists
+    os.Remove(monitorSocket)
+
+    args := []string{
+        "-name", fmt.Sprintf("guest=%s,debug-threads=on", vps.Name),
+        "-machine", "pc,accel=kvm,usb=off,vmport=off",
+        "-cpu", "host",
+        "-m", fmt.Sprintf("%d", RAM_SIZE),
+        "-smp", "2,sockets=2,cores=1,threads=1",
+        "-drive", fmt.Sprintf("file=%s,format=qcow2", vps.ImagePath),
+        "-drive", fmt.Sprintf("file=%s,format=raw", cloudInitPath),
+        "-vnc", fmt.Sprintf("0.0.0.0:%d", vps.VNCPort-5900),
+        "-device", "virtio-net-pci,netdev=user0",
+        "-netdev", fmt.Sprintf(
+            "user,id=user0,hostfwd=tcp:0.0.0.0:%d-:22",
+            vps.SSHPort,
+        ),
+        "-monitor", fmt.Sprintf("unix:%s,server,nowait", monitorSocket),
+        "-pidfile", pidFile,
+        "-daemonize",
+        "-enable-kvm",
+    }
+
+    cmd := exec.Command("qemu-system-x86_64", args...)
+    
+    stdout, err := os.Create(logFile)
+    if err != nil {
+        return fmt.Errorf("failed to create log file: %v", err)
+    }
+    defer stdout.Close()
+    cmd.Stdout = stdout
+    cmd.Stderr = stdout
+
+    vps.Status = StatusStarting
+
+    if err := cmd.Start(); err != nil {
+        vps.Status = StatusStopped
+        return fmt.Errorf("failed to start QEMU: %v", err)
+    }
+
+    // Wait for PID file
+    var pid int
+    timeout := time.After(30 * time.Second)
+    ticker := time.NewTicker(500 * time.Millisecond)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-timeout:
+            vps.Status = StatusStopped
+            logs, _ := os.ReadFile(logFile)
+            return fmt.Errorf("timeout waiting for QEMU to start. Logs: %s", string(logs))
+            
+        case <-ticker.C:
+            if pidBytes, err := os.ReadFile(pidFile); err == nil {
+                if _, err := fmt.Sscanf(string(pidBytes), "%d", &pid); err == nil {
+                    goto pidFound
+                }
+            }
+        }
+    }
+
+pidFound:
+    // Verify QEMU process
+    retries := 3
+    for i := 0; i < retries; i++ {
+        if err := checkProcess(pid); err == nil {
+            break
+        }
+        if i == retries-1 {
+            vps.Status = StatusStopped
+            logs, _ := os.ReadFile(logFile)
+            return fmt.Errorf("QEMU process verification failed after %d retries. Logs: %s", retries, string(logs))
+        }
+        time.Sleep(time.Second)
+    }
+
+    vps.QEMUPid = pid
+    vps.Status = StatusRunning
+
+    return nil
+}
+
+func (m *VPSManager) RestartVPS(id string) error {
+    m.mutex.Lock()
+    defer m.mutex.Unlock()
+
+    vps, exists := m.instances[id]
+    if !exists {
+        return fmt.Errorf("VPS not found")
+    }
+
+    if vps.Status != StatusRunning {
+        return fmt.Errorf("VPS must be running to restart")
+    }
+
+    if vps.QEMUPid <= 0 {
+        return fmt.Errorf("VPS does not have a valid PID")
+    }
+
+    // Get the QEMU monitor socket path
+    instanceDir := filepath.Join(m.baseDir, "disks", vps.ID)
+    monitorSocket := filepath.Join(instanceDir, "qemu-monitor.sock")
+
+    // Create a temporary file for command output
+    tmpFile, err := os.CreateTemp("", "qemu-command-*")
+    if err != nil {
+        return fmt.Errorf("failed to create temp file: %v", err)
+    }
+    defer os.Remove(tmpFile.Name())
+
+    // Send system_reset command to QEMU monitor
+    cmd := exec.Command("echo", "system_reset")
+    socat := exec.Command("socat", "-", fmt.Sprintf("UNIX-CONNECT:%s", monitorSocket))
+    
+    // Connect the commands
+    socatIn, err := socat.StdinPipe()
+    if err != nil {
+        return fmt.Errorf("failed to create pipe: %v", err)
+    }
+    
+    cmd.Stdout = socatIn
+    socat.Stdout = tmpFile
+    socat.Stderr = tmpFile
+
+    // Start socat first
+    if err := socat.Start(); err != nil {
+        return fmt.Errorf("failed to start socat: %v", err)
+    }
+
+    // Run the echo command
+    if err := cmd.Run(); err != nil {
+        return fmt.Errorf("failed to send command: %v", err)
+    }
+
+    // Close stdin pipe
+    socatIn.Close()
+
+    // Wait for socat to finish
+    if err := socat.Wait(); err != nil {
+        output, _ := os.ReadFile(tmpFile.Name())
+        return fmt.Errorf("failed to execute command: %v, output: %s", err, string(output))
+    }
+
+    vps.Status = StatusRestarting
+
+    // Update status after a delay
+    go func() {
+        time.Sleep(30 * time.Second)
+        m.mutex.Lock()
+        vps.Status = StatusRunning
+        m.mutex.Unlock()
+    }()
+
+    return nil
+}
+
+// Add new HTTP handlers for the start/stop operations
+func (m *VPSManager) handleStartVPS(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    id := r.URL.Query().Get("id")
+    if err := m.StartVPS(id); err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    w.WriteHeader(http.StatusOK)
+}
+
+func (m *VPSManager) handleStopVPS(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    id := r.URL.Query().Get("id")
+    if err := m.StopVPS(id); err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    w.WriteHeader(http.StatusOK)
+}
+// Add new HTTP handler for restart endpoint
+func (m *VPSManager) handleRestartVPS(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    id := r.URL.Query().Get("id")
+    if err := m.RestartVPS(id); err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    w.WriteHeader(http.StatusOK)
 }
 
 func (m *VPSManager) scheduleCleanup(vps *VPS) {
@@ -924,7 +1248,10 @@ func main() {
     apiMux.HandleFunc("/api/vps/progress", manager.handleGetProgress)
     apiMux.HandleFunc("/api/images/list", manager.handleListImages)
     apiMux.HandleFunc("/api/vps/delete", manager.handleDeleteVPS)
-
+    apiMux.HandleFunc("/api/vps/restart", manager.handleRestartVPS)
+    apiMux.HandleFunc("/api/vps/start", manager.handleStartVPS)
+    apiMux.HandleFunc("/api/vps/stop", manager.handleStopVPS)
+    
     http.Handle("/api/", NewAuthMiddleware(apiKey, apiMux))
     http.Handle("/novnc/", http.StripPrefix("/novnc/", http.FileServer(http.Dir("/usr/share/novnc"))))
 
