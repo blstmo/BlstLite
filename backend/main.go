@@ -22,8 +22,12 @@ import (
 
 const (
     UBUNTU_IMAGE_URL = "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img"
-    BASE_IMAGE_PATH  = "/var/lib/vps-service/base/ubuntu-22.04.qcow2"
-    VPS_LIFETIME     = 15 * time.Minute
+    DEBIAN_IMAGE_URL = "https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-generic-amd64.qcow2"
+    FEDORA_IMAGE_URL = "https://download.fedoraproject.org/pub/fedora/linux/releases/38/Cloud/x86_64/images/Fedora-Cloud-Base-38-1.6.x86_64.qcow2"
+    ARCH_IMAGE_URL   = "https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2"
+    
+    BASE_DIR        = "/var/lib/vps-service/base"
+    VPS_LIFETIME    = 15 * time.Minute
     RAM_SIZE        = 4096  // 4GB
     DISK_SIZE       = 50    // 50GB
     DOWNLOAD_SPEED  = 50    // 50Mbps
@@ -31,13 +35,22 @@ const (
     SSH_PORT_START  = 2200  // Starting port for SSH forwarding
 )
 
+var SUPPORTED_IMAGES = map[string]string{
+    "ubuntu-22.04": UBUNTU_IMAGE_URL,
+    "debian-11":    DEBIAN_IMAGE_URL,
+    "fedora-38":    FEDORA_IMAGE_URL,
+    "arch-linux":   ARCH_IMAGE_URL,
+}
+
+// Update the VPS struct to include ImageType
 type VPS struct {
     ID          string    `json:"id"`
     Name        string    `json:"name"`
     Status      string    `json:"status"`
+    ImageType   string    `json:"image_type"`  // Add this field
     QEMUPid     int       `json:"qemu_pid,omitempty"`
     VNCPort     int       `json:"vnc_port"`
-    SSHPort     int       `json:"ssh_port"` 
+    SSHPort     int       `json:"ssh_port"`
     CreatedAt   time.Time `json:"created_at"`
     ExpiresAt   time.Time `json:"expires_at"`
     ImagePath   string    `json:"image_path"`
@@ -51,6 +64,12 @@ type VPSManager struct {
     nextSSHPort  int       // Added to track SSH ports
     baseDir      string
 }
+
+
+func getBaseImagePath(imageType string) string {
+    return filepath.Join(BASE_DIR, imageType + ".qcow2")
+}
+
 
 func checkProcess(pid int) error {
     proc, err := os.FindProcess(pid)
@@ -92,9 +111,13 @@ func NewVPSManager(baseDir string) (*VPSManager, error) {
         }
     }
 
-    if _, err := os.Stat(BASE_IMAGE_PATH); os.IsNotExist(err) {
-        if err := downloadAndPrepareBaseImage(); err != nil {
-            return nil, err
+    // Download all base images if they don't exist
+    for imageType := range SUPPORTED_IMAGES {
+        baseImagePath := getBaseImagePath(imageType)
+        if _, err := os.Stat(baseImagePath); os.IsNotExist(err) {
+            if err := downloadAndPrepareBaseImage(imageType); err != nil {
+                log.Printf("Warning: Failed to prepare %s base image: %v", imageType, err)
+            }
         }
     }
 
@@ -106,8 +129,14 @@ func NewVPSManager(baseDir string) (*VPSManager, error) {
     }, nil
 }
 
-func downloadAndPrepareBaseImage() error {
-    log.Printf("Starting base image preparation")
+
+func downloadAndPrepareBaseImage(imageType string) error {
+    imageURL, exists := SUPPORTED_IMAGES[imageType]
+    if !exists {
+        return fmt.Errorf("unsupported image type: %s", imageType)
+    }
+
+    log.Printf("Starting base image preparation for %s", imageType)
     
     tmpDir := "/tmp/vps-download"
     if err := os.MkdirAll(tmpDir, 0755); err != nil {
@@ -115,100 +144,125 @@ func downloadAndPrepareBaseImage() error {
     }
     defer os.RemoveAll(tmpDir)
 
-    tmpImagePath := filepath.Join(tmpDir, "ubuntu-22.04.img")
+    tmpImagePath := filepath.Join(tmpDir, filepath.Base(imageURL))
+    baseImagePath := getBaseImagePath(imageType)
     
-    log.Printf("Downloading Ubuntu cloud image to %s", tmpImagePath)
+    log.Printf("Downloading %s image to %s", imageType, tmpImagePath)
     downloadCmd := exec.Command("wget",
         "--progress=bar:force",
         "-O", tmpImagePath,
-        UBUNTU_IMAGE_URL)
+        imageURL)
     downloadCmd.Stdout = os.Stdout
     downloadCmd.Stderr = os.Stderr
     
     if err := downloadCmd.Run(); err != nil {
-        return fmt.Errorf("failed to download Ubuntu image: %v", err)
+        return fmt.Errorf("failed to download image: %v", err)
     }
 
-    baseDir := filepath.Dir(BASE_IMAGE_PATH)
+    baseDir := filepath.Dir(baseImagePath)
     if err := os.MkdirAll(baseDir, 0755); err != nil {
         return fmt.Errorf("failed to create base directory: %v", err)
     }
 
     log.Printf("Converting and resizing image to %dG", DISK_SIZE)
     convertCmd := exec.Command("qemu-img", "convert",
-        "-f", "raw",
+        "-f", "qcow2",
         "-O", "qcow2",
         tmpImagePath,
-        BASE_IMAGE_PATH)
+        baseImagePath)
     
     if output, err := convertCmd.CombinedOutput(); err != nil {
         return fmt.Errorf("failed to convert image: %v, output: %s", err, string(output))
     }
 
     // Resize the image
-    resizeCmd := exec.Command("qemu-img", "resize", BASE_IMAGE_PATH, fmt.Sprintf("%dG", DISK_SIZE))
+    resizeCmd := exec.Command("qemu-img", "resize", baseImagePath, fmt.Sprintf("%dG", DISK_SIZE))
     if output, err := resizeCmd.CombinedOutput(); err != nil {
         return fmt.Errorf("failed to resize image: %v, output: %s", err, string(output))
     }
 
-    if err := os.Chmod(BASE_IMAGE_PATH, 0644); err != nil {
+    if err := os.Chmod(baseImagePath, 0644); err != nil {
         return fmt.Errorf("failed to set image permissions: %v", err)
     }
 
-    log.Printf("Base image preparation completed successfully")
+    log.Printf("Base image preparation completed successfully for %s", imageType)
     return nil
 }
 
-func createCloudInitISO(path string, rootPassword string) error {
+
+func createCloudInitISO(path string, rootPassword string, imageType string) error {
     tmpDir, err := os.MkdirTemp("", "cloud-init")
     if err != nil {
         return err
     }
     defer os.RemoveAll(tmpDir)
 
-    // Updated cloud-init configuration with more explicit password settings
-    userData := fmt.Sprintf(`#cloud-config
+    // Customize cloud-init config based on image type
+    var userData string
+    switch imageType {
+    case "arch-linux":
+        userData = fmt.Sprintf(`#cloud-config
 users:
   - name: root
     lock_passwd: false
-    passwd: "%s"
-    hashed_passwd: null
     ssh_pwauth: true
+    passwd: %s
 
-# Enable password authentication in SSH
 ssh_pwauth: true
-
-# Disable SSH root lockout
 disable_root: false
 
-# More direct password configuration
+bootcmd:
+  - systemctl enable sshd
+  - systemctl start sshd`, rootPassword)
+    
+    case "fedora-38":
+        userData = fmt.Sprintf(`#cloud-config
+users:
+  - name: root
+    lock_passwd: false
+    ssh_pwauth: true
+
 chpasswd:
   list: |
-     root:%s
+    root:%s
   expire: false
 
-# Make sure SSH password auth is enabled in sshd_config
-write_files:
-  - path: /etc/ssh/sshd_config.d/99-cloud-init.conf
-    content: |
-        PasswordAuthentication yes
-        PermitRootLogin yes
+ssh_pwauth: true
+disable_root: false
 
 runcmd:
-  - systemctl restart ssh
-  - echo "root:%s" | chpasswd
-`, rootPassword, rootPassword, rootPassword)
+  - sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+  - systemctl restart sshd`, rootPassword)
+    
+    default: // Ubuntu and Debian use similar cloud-init configs
+        userData = fmt.Sprintf(`#cloud-config
+users:
+  - name: root
+    lock_passwd: false
+    ssh_pwauth: true
+
+chpasswd:
+  list: |
+    root:%s
+  expire: false
+
+ssh_pwauth: true
+disable_root: false
+
+runcmd:
+  - sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+  - systemctl restart ssh`, rootPassword)
+    }
 
     if err := os.WriteFile(filepath.Join(tmpDir, "user-data"), []byte(userData), 0644); err != nil {
         return err
     }
 
-    metaData := "instance-id: 1\nlocal-hostname: ubuntu-vps\n"
+    metaData := fmt.Sprintf("instance-id: 1\nlocal-hostname: %s-vps\n", imageType)
     if err := os.WriteFile(filepath.Join(tmpDir, "meta-data"), []byte(metaData), 0644); err != nil {
         return err
     }
 
-    // Create a new ISO with the cloud-init config
     cmd := exec.Command("genisoimage", "-output", path, "-volid", "cidata", "-joliet", "-rock",
         filepath.Join(tmpDir, "user-data"), filepath.Join(tmpDir, "meta-data"))
 
@@ -216,9 +270,9 @@ runcmd:
         return fmt.Errorf("failed to create ISO: %v, output: %s", err, string(output))
     }
 
-    log.Printf("Created cloud-init ISO at %s with password configuration", path)
     return nil
 }
+
 
 func startWebsockifyProxy(vncPort int) error {
     // Calculate websocket port (6900 + offset)
@@ -278,12 +332,27 @@ func stopWebsockifyProxy(vncPort int) error {
     return nil
 }
 
-func (m *VPSManager) CreateVPS(name string) (*VPS, error) {
+func (m *VPSManager) CreateVPS(name string, imageType string) (*VPS, error) {
     m.mutex.Lock()
     defer m.mutex.Unlock()
 
-    log.Printf("Starting VPS creation process for: %s", name)
+    log.Printf("Starting VPS creation process for: %s with image: %s", name, imageType)
 
+    // Validate image type
+    if _, exists := SUPPORTED_IMAGES[imageType]; !exists {
+        return nil, fmt.Errorf("unsupported image type: %s", imageType)
+    }
+
+    // Check/prepare base image
+    baseImagePath := getBaseImagePath(imageType)
+    if _, err := os.Stat(baseImagePath); os.IsNotExist(err) {
+        log.Printf("Base image for %s not found, downloading...", imageType)
+        if err := downloadAndPrepareBaseImage(imageType); err != nil {
+            return nil, fmt.Errorf("failed to prepare base image: %v", err)
+        }
+    }
+
+    // Generate password and create VPS struct
     password, err := generatePassword()
     if err != nil {
         return nil, fmt.Errorf("failed to generate password: %v", err)
@@ -293,8 +362,9 @@ func (m *VPSManager) CreateVPS(name string) (*VPS, error) {
         ID:          uuid.New().String(),
         Name:        name,
         Status:      "creating",
+        ImageType:   imageType,
         VNCPort:     m.nextVNCPort,
-        SSHPort:     m.nextSSHPort,  // Assign SSH port
+        SSHPort:     m.nextSSHPort,
         CreatedAt:   time.Now(),
         ExpiresAt:   time.Now().Add(VPS_LIFETIME),
         Password:    password,
@@ -302,18 +372,20 @@ func (m *VPSManager) CreateVPS(name string) (*VPS, error) {
     m.nextVNCPort++
     m.nextSSHPort++
 
+    // Create instance directory
     instanceDir := filepath.Join(m.baseDir, "disks", vps.ID)
     if err := os.MkdirAll(instanceDir, 0755); err != nil {
         return nil, fmt.Errorf("failed to create instance directory: %v", err)
     }
 
+    // Create disk image
     vps.ImagePath = filepath.Join(instanceDir, "disk.qcow2")
     log.Printf("Creating disk image at: %s", vps.ImagePath)
 
     createDisk := exec.Command("qemu-img", "create",
         "-f", "qcow2",
         "-F", "qcow2",
-        "-b", BASE_IMAGE_PATH,
+        "-b", baseImagePath,
         vps.ImagePath)
     
     if output, err := createDisk.CombinedOutput(); err != nil {
@@ -321,14 +393,17 @@ func (m *VPSManager) CreateVPS(name string) (*VPS, error) {
         return nil, fmt.Errorf("failed to create disk: %v, output: %s", err, string(output))
     }
 
+    // Create cloud-init ISO
     cloudInitPath := filepath.Join(instanceDir, "cloud-init.iso")
-    if err := createCloudInitISO(cloudInitPath, vps.Password); err != nil {
+    if err := createCloudInitISO(cloudInitPath, vps.Password, imageType); err != nil {
         os.RemoveAll(instanceDir)
         return nil, fmt.Errorf("failed to create cloud-init ISO: %v", err)
     }
 
+    // Prepare QEMU command
     pidFile := filepath.Join(instanceDir, "qemu.pid")
-
+    
+    // Build QEMU arguments based on image type
     args := []string{
         "-name", fmt.Sprintf("guest=%s,debug-threads=on", vps.Name),
         "-machine", "pc,accel=kvm,usb=off,vmport=off",
@@ -343,13 +418,28 @@ func (m *VPSManager) CreateVPS(name string) (*VPS, error) {
             "user,id=user0,hostfwd=tcp:0.0.0.0:%d-:22",
             vps.SSHPort,
         ),
+    }
+
+    // Add image-specific arguments
+    switch imageType {
+    case "arch-linux":
+        // Arch Linux might need additional kernel parameters
+        args = append(args, "-append", "console=ttyS0 root=/dev/vda")
+    case "fedora-38":
+        // Fedora might need specific ACPI settings
+        args = append(args, "-machine", "pc,accel=kvm,usb=off,vmport=off,acpi=on")
+    }
+
+    // Add common final arguments
+    args = append(args,
         "-pidfile", pidFile,
         "-daemonize",
         "-enable-kvm",
-    }
+    )
 
     cmd := exec.Command("qemu-system-x86_64", args...)
     
+    // Setup logging
     logFile, err := os.Create(filepath.Join(m.baseDir, "logs", fmt.Sprintf("%s.log", vps.ID)))
     if err != nil {
         os.RemoveAll(instanceDir)
@@ -382,7 +472,7 @@ func (m *VPSManager) CreateVPS(name string) (*VPS, error) {
         }
     }
 
-    // Verify the QEMU process is running and valid
+    // Verify QEMU process
     if err := checkProcess(pid); err != nil {
         os.RemoveAll(instanceDir)
         return nil, fmt.Errorf("QEMU process verification failed: %v", err)
@@ -395,14 +485,13 @@ func (m *VPSManager) CreateVPS(name string) (*VPS, error) {
     // Start websockify proxy for VNC access
     if err := startWebsockifyProxy(vps.VNCPort); err != nil {
         log.Printf("Warning: Failed to start websockify proxy: %v", err)
-        // Don't fail the VPS creation if websockify fails, just log the error
     }
 
-    // Schedule cleanup after lifetime expires
+    // Schedule cleanup
     go m.scheduleCleanup(vps)
 
-    log.Printf("VPS %s (ID: %s) successfully created with PID %d, SSH port %d", 
-        vps.Name, vps.ID, vps.QEMUPid, vps.SSHPort)
+    log.Printf("VPS %s (ID: %s) successfully created with PID %d using image %s", 
+        vps.Name, vps.ID, vps.QEMUPid, imageType)
     return vps, nil
 }
 
@@ -482,14 +571,19 @@ func (m *VPSManager) handleCreateVPS(w http.ResponseWriter, r *http.Request) {
     }
 
     var req struct {
-        Name string `json:"name"`
+        Name      string `json:"name"`
+        ImageType string `json:"image_type"`
     }
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
         http.Error(w, err.Error(), http.StatusBadRequest)
         return
     }
 
-    vps, err := m.CreateVPS(req.Name)
+    if req.ImageType == "" {
+        req.ImageType = "ubuntu-22.04" // Default to Ubuntu if not specified
+    }
+
+    vps, err := m.CreateVPS(req.Name, req.ImageType)
     if err != nil {
         http.Error(w, err.Error(), http.StatusInternalServerError)
         return
@@ -497,6 +591,7 @@ func (m *VPSManager) handleCreateVPS(w http.ResponseWriter, r *http.Request) {
 
     json.NewEncoder(w).Encode(vps)
 }
+
 
 func (m *VPSManager) handleListVPS(w http.ResponseWriter, r *http.Request) {
     if r.Method != http.MethodGet {
@@ -541,6 +636,22 @@ func (m *VPSManager) handleDeleteVPS(w http.ResponseWriter, r *http.Request) {
 
     w.WriteHeader(http.StatusOK)
 }
+
+func (m *VPSManager) handleListImages(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodGet {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    images := make([]string, 0, len(SUPPORTED_IMAGES))
+    for imageType := range SUPPORTED_IMAGES {
+        images = append(images, imageType)
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(images)
+}
+
 
 type AuthMiddleware struct {
     apiKey string
@@ -688,6 +799,7 @@ func main() {
     apiMux.HandleFunc("/api/vps/create", manager.handleCreateVPS)
     apiMux.HandleFunc("/api/vps/list", manager.handleListVPS)
     apiMux.HandleFunc("/api/vps/get", manager.handleGetVPS)
+    apiMux.HandleFunc("/api/images/list", manager.handleListImages) // Add new endpoint
     apiMux.HandleFunc("/api/vps/delete", manager.handleDeleteVPS)
 
     http.Handle("/api/", NewAuthMiddleware(apiKey, apiMux))
