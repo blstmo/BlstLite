@@ -24,6 +24,7 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { CountdownTimer } from '@/components/countdown-timer';
 import { restartVPS, startVPS, stopVPS, getVPSDetails } from '@/app/actions';
+import ResourceMonitoring from './ResourceChart';
 
 interface VPSDetailProps {
   vps: VPSBackend;
@@ -348,7 +349,7 @@ export default function VPSDetail({ vps: initialVPS, onClose }: VPSDetailProps) 
           </div>
         </CardContent>
       </Card>
-
+      
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
@@ -373,6 +374,18 @@ export default function VPSDetail({ vps: initialVPS, onClose }: VPSDetailProps) 
           </div>
         </CardContent>
       </Card>
+
+      <Card>
+  <CardHeader>
+    <CardTitle>Resource Monitoring</CardTitle>
+  </CardHeader>
+  <CardContent>
+    <ResourceMonitoring 
+      vpsId={vps.id} 
+      isRunning={vps.status === 'running'} 
+    />
+  </CardContent>
+</Card>
     </div>
   );
 }

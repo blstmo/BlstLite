@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -13,6 +14,8 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -118,7 +121,18 @@ type VPSManager struct {
     nextVNCPort  int
     nextSSHPort  int
     baseDir      string
+    metricsCache map[string]*MetricsCache
+    metricsMutex sync.RWMutex
 }
+
+
+type MetricsCache struct {
+    LastUpdate     time.Time
+    LastDiskStats  DiskMetrics
+    LastNetStats   NetworkMetrics
+    MetricsHistory []ResourceMetrics
+}
+
 
 func getBaseImagePath(imageType string) string {
     return filepath.Join(BASE_DIR, imageType + ".qcow2")
@@ -173,12 +187,18 @@ func NewVPSManager(baseDir string) (*VPSManager, error) {
         }
     }
 
-    return &VPSManager{
-        instances:    make(map[string]*VPS),
-        nextVNCPort:  5900,
-        nextSSHPort:  SSH_PORT_START,
-        baseDir:      baseDir,
-    }, nil
+    manager := &VPSManager{
+        instances:     make(map[string]*VPS),
+        nextVNCPort:   5900,
+        nextSSHPort:   SSH_PORT_START,
+        baseDir:       baseDir,
+        metricsCache:  make(map[string]*MetricsCache),
+    }
+
+    // Start metrics collection routine
+    go manager.metricsCollector()
+    
+    return manager, nil
 }
 
 func downloadAndPrepareBaseImage(imageType string) error {
@@ -1194,6 +1214,480 @@ func (m *VPSManager) cleanup() {
     log.Println("All VPS instances have been cleaned up")
 }
 
+
+
+
+type ResourceMetrics struct {
+    CPU     CPUMetrics     `json:"cpu"`
+    Memory  MemoryMetrics  `json:"memory"`
+    Disk    DiskMetrics    `json:"disk"`
+    Network NetworkMetrics `json:"network"`
+    Time    time.Time      `json:"time"`
+}
+
+type CPUMetrics struct {
+    Usage float64 `json:"usage"` // Percentage (0-100)
+}
+
+type MemoryMetrics struct {
+    Used  int64 `json:"used"`  // Bytes
+    Total int64 `json:"total"` // Bytes
+    Cache int64 `json:"cache"` // Bytes
+}
+
+type DiskMetrics struct {
+    ReadBytes  int64   `json:"read_bytes"`
+    WriteBytes int64   `json:"write_bytes"`
+    ReadOps    int64   `json:"read_ops"`
+    WriteOps   int64   `json:"write_ops"`
+    ReadSpeed  float64 `json:"read_speed"`  // Bytes per second
+    WriteSpeed float64 `json:"write_speed"` // Bytes per second
+}
+
+type NetworkMetrics struct {
+    RXBytes    int64   `json:"rx_bytes"`
+    TXBytes    int64   `json:"tx_bytes"`
+    RXPackets  int64   `json:"rx_packets"`
+    TXPackets  int64   `json:"tx_packets"`
+    RXSpeed    float64 `json:"rx_speed"` // Bytes per second
+    TXSpeed    float64 `json:"tx_speed"` // Bytes per second
+}
+
+
+
+func (m *VPSManager) metricsCollector() {
+    ticker := time.NewTicker(2 * time.Second)
+    defer ticker.Stop()
+
+    for range ticker.C {
+        m.mutex.RLock()
+        instances := make(map[string]*VPS)
+        for id, vps := range m.instances {
+            instances[id] = vps
+        }
+        m.mutex.RUnlock()
+
+        for id, vps := range instances {
+            if vps.Status == StatusRunning {
+                if metrics, err := m.collectMetrics(id); err == nil {
+                    m.updateMetricsCache(id, metrics)
+                }
+            }
+        }
+    }
+}
+
+func (m *VPSManager) collectMetrics(id string) (*ResourceMetrics, error) {
+    m.mutex.RLock()
+    vps, exists := m.instances[id]
+    m.mutex.RUnlock()
+
+    if !exists || vps.QEMUPid <= 0 {
+        return nil, fmt.Errorf("VPS not found or not running")
+    }
+
+    metrics := &ResourceMetrics{
+        Time: time.Now(),
+    }
+
+    // Get CPU stats from /proc/[pid]/stat
+    if cpuStats, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", vps.QEMUPid)); err == nil {
+        fields := strings.Fields(string(cpuStats))
+        if len(fields) >= 15 {
+            utime, _ := strconv.ParseInt(fields[13], 10, 64)
+            stime, _ := strconv.ParseInt(fields[14], 10, 64)
+            
+            total := float64(utime + stime)
+            // Calculate percentage based on total system time
+            if uptime, err := os.ReadFile("/proc/uptime"); err == nil {
+                uptimeFields := strings.Fields(string(uptime))
+                if systemUptime, err := strconv.ParseFloat(uptimeFields[0], 64); err == nil {
+                    numCPUs := float64(runtime.NumCPU())
+                    cpuUsage := (total / systemUptime) * (100 / numCPUs)
+                    metrics.CPU = CPUMetrics{
+                        Usage: cpuUsage,
+                    }
+                }
+            }
+        }
+    }
+
+    // Get memory stats from /proc/[pid]/status
+    if memStats, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", vps.QEMUPid)); err == nil {
+        var vmSize, rss int64
+        scanner := bufio.NewScanner(strings.NewReader(string(memStats)))
+        for scanner.Scan() {
+            line := scanner.Text()
+            if strings.HasPrefix(line, "VmSize:") {
+                fields := strings.Fields(line)
+                if len(fields) >= 2 {
+                    vmSize, _ = strconv.ParseInt(fields[1], 10, 64)
+                    vmSize *= 1024 // Convert from KB to bytes
+                }
+            } else if strings.HasPrefix(line, "VmRSS:") {
+                fields := strings.Fields(line)
+                if len(fields) >= 2 {
+                    rss, _ = strconv.ParseInt(fields[1], 10, 64)
+                    rss *= 1024 // Convert from KB to bytes
+                }
+            }
+        }
+        metrics.Memory = MemoryMetrics{
+            Used:  rss,
+            Total: int64(RAM_SIZE) * 1024 * 1024, // Convert MB to bytes
+            Cache: vmSize - rss,
+        }
+    }
+
+    // Get disk I/O stats from /proc/[pid]/io
+    if ioStats, err := os.ReadFile(fmt.Sprintf("/proc/%d/io", vps.QEMUPid)); err == nil {
+        var readBytes, writeBytes int64
+        scanner := bufio.NewScanner(strings.NewReader(string(ioStats)))
+        for scanner.Scan() {
+            line := scanner.Text()
+            if strings.HasPrefix(line, "read_bytes:") {
+                fields := strings.Fields(line)
+                if len(fields) >= 2 {
+                    readBytes, _ = strconv.ParseInt(fields[1], 10, 64)
+                }
+            } else if strings.HasPrefix(line, "write_bytes:") {
+                fields := strings.Fields(line)
+                if len(fields) >= 2 {
+                    writeBytes, _ = strconv.ParseInt(fields[1], 10, 64)
+                }
+            }
+        }
+        metrics.Disk = DiskMetrics{
+            ReadBytes:  readBytes,
+            WriteBytes: writeBytes,
+            ReadOps:    0, // These will be calculated from differences
+            WriteOps:   0,
+            ReadSpeed:  0,
+            WriteSpeed: 0,
+        }
+    }
+
+    // Get network stats using ip link
+    metrics.Network = NetworkMetrics{
+        RXBytes:   0,
+        TXBytes:   0,
+        RXPackets: 0,
+        TXPackets: 0,
+        RXSpeed:   0,
+        TXSpeed:   0,
+    }
+
+    // Find the tap device for this VPS
+    cmd := exec.Command("ip", "link", "show")
+    output, err := cmd.Output()
+    if err == nil {
+        scanner := bufio.NewScanner(strings.NewReader(string(output)))
+        var currentIface string
+        for scanner.Scan() {
+            line := scanner.Text()
+            if strings.Contains(line, fmt.Sprintf("tap%d", vps.QEMUPid)) {
+                currentIface = fmt.Sprintf("tap%d", vps.QEMUPid)
+                break
+            }
+        }
+
+        if currentIface != "" {
+            if stats, err := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/statistics/rx_bytes", currentIface)); err == nil {
+                metrics.Network.RXBytes, _ = strconv.ParseInt(strings.TrimSpace(string(stats)), 10, 64)
+            }
+            if stats, err := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/statistics/tx_bytes", currentIface)); err == nil {
+                metrics.Network.TXBytes, _ = strconv.ParseInt(strings.TrimSpace(string(stats)), 10, 64)
+            }
+            if stats, err := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/statistics/rx_packets", currentIface)); err == nil {
+                metrics.Network.RXPackets, _ = strconv.ParseInt(strings.TrimSpace(string(stats)), 10, 64)
+            }
+            if stats, err := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/statistics/tx_packets", currentIface)); err == nil {
+                metrics.Network.TXPackets, _ = strconv.ParseInt(strings.TrimSpace(string(stats)), 10, 64)
+            }
+        }
+    }
+
+    // Get the metrics cache for this VPS
+    m.metricsMutex.Lock()
+    cache, exists := m.metricsCache[id]
+    if exists && !cache.LastUpdate.IsZero() {
+        // Calculate speeds based on the time difference
+        duration := metrics.Time.Sub(cache.LastUpdate).Seconds()
+        if duration > 0 {
+            // Calculate disk speeds
+            metrics.Disk.ReadSpeed = float64(metrics.Disk.ReadBytes-cache.LastDiskStats.ReadBytes) / duration
+            metrics.Disk.WriteSpeed = float64(metrics.Disk.WriteBytes-cache.LastDiskStats.WriteBytes) / duration
+            
+            // Calculate network speeds
+            metrics.Network.RXSpeed = float64(metrics.Network.RXBytes-cache.LastNetStats.RXBytes) / duration
+            metrics.Network.TXSpeed = float64(metrics.Network.TXBytes-cache.LastNetStats.TXBytes) / duration
+        }
+    }
+    m.metricsMutex.Unlock()
+
+    return metrics, nil
+}
+
+func (m *VPSManager) executeQMPCommand(socket, command string) ([]byte, error) {
+    tmpFile, err := os.CreateTemp("", "qmp-*")
+    if err != nil {
+        return nil, err
+    }
+    defer os.Remove(tmpFile.Name())
+
+    cmd := exec.Command("echo", command)
+    socat := exec.Command("socat", "-", fmt.Sprintf("UNIX-CONNECT:%s", socket))
+    
+    socatIn, err := socat.StdinPipe()
+    if err != nil {
+        return nil, err
+    }
+    
+    cmd.Stdout = socatIn
+    socat.Stdout = tmpFile
+
+    if err := socat.Start(); err != nil {
+        return nil, err
+    }
+
+    if err := cmd.Run(); err != nil {
+        return nil, err
+    }
+
+    socatIn.Close()
+    if err := socat.Wait(); err != nil {
+        return nil, err
+    }
+
+    return os.ReadFile(tmpFile.Name())
+}
+
+func (m *VPSManager) updateMetricsCache(id string, metrics *ResourceMetrics) {
+    m.metricsMutex.Lock()
+    defer m.metricsMutex.Unlock()
+
+    cache, exists := m.metricsCache[id]
+    if !exists {
+        cache = &MetricsCache{
+            MetricsHistory: make([]ResourceMetrics, 0, 300), // Store 10 minutes of data at 2s intervals
+        }
+        m.metricsCache[id] = cache
+    }
+
+    // Calculate speeds based on previous measurements
+    if !cache.LastUpdate.IsZero() {
+        duration := metrics.Time.Sub(cache.LastUpdate).Seconds()
+        if duration > 0 {
+            // Calculate disk speeds
+            metrics.Disk.ReadSpeed = float64(metrics.Disk.ReadBytes-cache.LastDiskStats.ReadBytes) / duration
+            metrics.Disk.WriteSpeed = float64(metrics.Disk.WriteBytes-cache.LastDiskStats.WriteBytes) / duration
+
+            // Calculate network speeds
+            metrics.Network.RXSpeed = float64(metrics.Network.RXBytes-cache.LastNetStats.RXBytes) / duration
+            metrics.Network.TXSpeed = float64(metrics.Network.TXBytes-cache.LastNetStats.TXBytes) / duration
+        }
+    }
+
+    // Update cache
+    cache.LastUpdate = metrics.Time
+    cache.LastDiskStats = metrics.Disk
+    cache.LastNetStats = metrics.Network
+    
+    // Add to history and maintain window
+    cache.MetricsHistory = append(cache.MetricsHistory, *metrics)
+    if len(cache.MetricsHistory) > 300 {
+        cache.MetricsHistory = cache.MetricsHistory[1:]
+    }
+}
+
+// Add new HTTP handler
+func (m *VPSManager) handleGetMetrics(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodGet {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    id := r.URL.Query().Get("id")
+    if id == "" {
+        http.Error(w, "Missing VPS ID", http.StatusBadRequest)
+        return
+    }
+
+    m.metricsMutex.RLock()
+    cache, exists := m.metricsCache[id]
+    m.metricsMutex.RUnlock()
+
+    if !exists {
+        http.Error(w, "No metrics available for this VPS", http.StatusNotFound)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(cache.MetricsHistory)
+}
+
+// Add these methods to your VPSManager struct
+
+func (m *VPSManager) parseCPUMetrics(data []byte) CPUMetrics {
+    var cpuMetrics CPUMetrics
+    
+    // Example JSON response from QEMU:
+    // [{"CPU":0,"current":true,"halted":false,"qom_path":"/machine/unattached/device[0]","thread_id":123},...]
+    type CPUInfo struct {
+        CPU       int  `json:"CPU"`
+        Current   bool `json:"current"`
+        Halted    bool `json:"halted"`
+        ThreadID  int  `json:"thread_id"`
+    }
+    
+    var cpuInfos []CPUInfo
+    if err := json.Unmarshal(data, &cpuInfos); err != nil {
+        return cpuMetrics
+    }
+
+    // Get CPU usage by checking /proc/[thread_id]/stat for each CPU
+    var totalUsage float64
+    for _, cpu := range cpuInfos {
+        if cpu.ThreadID > 0 {
+            usage := getThreadCPUUsage(cpu.ThreadID)
+            totalUsage += usage
+        }
+    }
+
+    // Average the usage across all CPUs
+    if len(cpuInfos) > 0 {
+        cpuMetrics.Usage = totalUsage / float64(len(cpuInfos))
+    }
+
+    return cpuMetrics
+}
+
+func (m *VPSManager) parseMemoryMetrics(data []byte) MemoryMetrics {
+    var memMetrics MemoryMetrics
+    
+    // Example JSON response from QEMU:
+    // {"base-memory": 4294967296, "plugged-memory": 0}
+    type MemInfo struct {
+        BaseMemory    int64 `json:"base-memory"`
+        PluggedMemory int64 `json:"plugged-memory"`
+    }
+    
+    var memInfo MemInfo
+    if err := json.Unmarshal(data, &memInfo); err != nil {
+        return memMetrics
+    }
+
+    memMetrics.Total = memInfo.BaseMemory + memInfo.PluggedMemory
+    
+    // Try to get actual memory usage from balloon device
+    if balloonData, err := m.executeQMPCommand(filepath.Join(m.baseDir, "monitor.sock"), "query-balloon"); err == nil {
+        type BalloonInfo struct {
+            Actual int64 `json:"actual"`
+        }
+        var balloonInfo BalloonInfo
+        if err := json.Unmarshal(balloonData, &balloonInfo); err == nil {
+            memMetrics.Used = balloonInfo.Actual
+        }
+    }
+
+    return memMetrics
+}
+
+func (m *VPSManager) parseDiskMetrics(data []byte) DiskMetrics {
+    var diskMetrics DiskMetrics
+    
+    // Example JSON response from QEMU:
+    // [{"device":"drive-virtio-disk0","stats":{"rd_bytes":1234,"wr_bytes":5678,"rd_operations":10,"wr_operations":20}}]
+    type BlockStats struct {
+        Stats struct {
+            ReadBytes    int64 `json:"rd_bytes"`
+            WriteBytes   int64 `json:"wr_bytes"`
+            ReadOps     int64 `json:"rd_operations"`
+            WriteOps    int64 `json:"wr_operations"`
+        } `json:"stats"`
+    }
+    
+    var blockInfos []BlockStats
+    if err := json.Unmarshal(data, &blockInfos); err != nil {
+        return diskMetrics
+    }
+
+    // Sum up stats from all block devices
+    for _, block := range blockInfos {
+        diskMetrics.ReadBytes += block.Stats.ReadBytes
+        diskMetrics.WriteBytes += block.Stats.WriteBytes
+        diskMetrics.ReadOps += block.Stats.ReadOps
+        diskMetrics.WriteOps += block.Stats.WriteOps
+    }
+
+    return diskMetrics
+}
+
+func (m *VPSManager) parseNetworkMetrics(data []byte) NetworkMetrics {
+    var netMetrics NetworkMetrics
+    
+    // Example JSON response from QEMU:
+    // [{"name":"net0","stats":{"rx_bytes":1234,"tx_bytes":5678,"rx_packets":10,"tx_packets":20}}]
+    type NetStats struct {
+        Stats struct {
+            RXBytes     int64 `json:"rx_bytes"`
+            TXBytes     int64 `json:"tx_bytes"`
+            RXPackets   int64 `json:"rx_packets"`
+            TXPackets   int64 `json:"tx_packets"`
+        } `json:"stats"`
+    }
+    
+    var netInfos []NetStats
+    if err := json.Unmarshal(data, &netInfos); err != nil {
+        return netMetrics
+    }
+
+    // Sum up stats from all network interfaces
+    for _, net := range netInfos {
+        netMetrics.RXBytes += net.Stats.RXBytes
+        netMetrics.TXBytes += net.Stats.TXBytes
+        netMetrics.RXPackets += net.Stats.RXPackets
+        netMetrics.TXPackets += net.Stats.TXPackets
+    }
+
+    return netMetrics
+}
+
+// Helper function to get CPU usage for a specific thread
+func getThreadCPUUsage(threadID int) float64 {
+    data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", threadID))
+    if err != nil {
+        return 0
+    }
+
+    fields := strings.Fields(string(data))
+    if len(fields) < 15 {
+        return 0
+    }
+
+    // Fields 14 and 15 are utime and stime (user and system CPU time)
+    utime, _ := strconv.ParseFloat(fields[13], 64)
+    stime, _ := strconv.ParseFloat(fields[14], 64)
+    
+    // Calculate CPU usage percentage based on total CPU time
+    totalCPUTime := utime + stime
+    
+    // Get process uptime
+    if uptimeData, err := os.ReadFile("/proc/uptime"); err == nil {
+        uptime, _ := strconv.ParseFloat(strings.Fields(string(uptimeData))[0], 64)
+        if uptime > 0 {
+            // Calculate percentage based on total CPU time and uptime
+            // Multiply by 100 for percentage and divide by number of CPUs
+            numCPUs := float64(runtime.NumCPU())
+            return (totalCPUTime / (uptime * numCPUs)) * 100
+        }
+    }
+
+    return 0
+}
+
+
+
 func main() {
     log.Printf("Verifying system requirements...")
     if err := verifySystemRequirements(); err != nil {
@@ -1241,6 +1735,10 @@ func main() {
         }
     }()
 
+
+
+
+
     apiMux := http.NewServeMux()
     apiMux.HandleFunc("/api/vps/create", manager.handleCreateVPS)
     apiMux.HandleFunc("/api/vps/list", manager.handleListVPS)
@@ -1250,6 +1748,7 @@ func main() {
     apiMux.HandleFunc("/api/vps/delete", manager.handleDeleteVPS)
     apiMux.HandleFunc("/api/vps/restart", manager.handleRestartVPS)
     apiMux.HandleFunc("/api/vps/start", manager.handleStartVPS)
+    apiMux.HandleFunc("/api/vps/metrics", manager.handleGetMetrics)
     apiMux.HandleFunc("/api/vps/stop", manager.handleStopVPS)
     
     http.Handle("/api/", NewAuthMiddleware(apiKey, apiMux))
