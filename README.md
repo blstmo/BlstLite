@@ -8,6 +8,7 @@ Join our community: <a href="https://discord.gg/wkgx7Bf2Yt">https://discord.gg/w
 <img src="/images/manage1.png" alt="Manage 1">  
 <img src="/images/manage2.png" alt="Manage 2">  
 <img src="/images/manage3.png" alt="Manage 3">  
+<img src="/images/manage4.png" alt="Manage 4">  
 
 # Issues & Bugs
 
