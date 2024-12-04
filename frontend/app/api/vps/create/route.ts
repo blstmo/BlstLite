@@ -1,4 +1,3 @@
-// app/api/vps/create/route.ts
 import { NextResponse } from 'next/server';
 import { API_CONFIG } from '@/lib/config';
 
@@ -15,7 +14,10 @@ export async function POST(request: Request) {
         'Content-Type': 'application/json',
         'X-API-Key': API_CONFIG.apiKey || ''
       },
-      body: JSON.stringify(body)
+      body: JSON.stringify({
+        name: body.name,
+        image_type: body.image_type || 'ubuntu-22.04' // Default to Ubuntu if not specified
+      })
     });
 
     const responseText = await response.text();
