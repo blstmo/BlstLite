@@ -24,6 +24,27 @@ Join our community: <a href="https://discord.gg/wkgx7Bf2Yt">https://discord.gg/w
 
 # Changelog
 
+# Changelog
+
+## Version 1.1.3 (2024-12-04)
+### Added Features
+- Added comprehensive network metrics collection for VPS instances
+- Implemented real-time network traffic monitoring (RX/TX bytes and packets)
+- Added network speed calculations (bytes/sec) for both upload and download
+- Enhanced metrics logging for better debugging and monitoring
+
+### Technical Improvements
+- Added multiple fallback methods for network statistics collection
+- Implemented QMP (QEMU Machine Protocol) based network monitoring
+- Added direct process statistics monitoring through /proc filesystem
+- Enhanced metrics caching for accurate speed calculations
+
+### Bug Fixes
+- Resolved network metrics collection in user-mode networking
+- Improved network device detection reliability
+- Added better error handling for network statistics collection
+
+
 ## Version 1.1.2 (2024-12-04)
 ### Added Features
 - Implemented VPS power management controls (Start, Stop, Restart)

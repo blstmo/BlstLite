@@ -10,9 +10,11 @@ import {
   YAxis,
   CartesianGrid,
   Tooltip,
-  ResponsiveContainer
+  ResponsiveContainer,
+  Legend
 } from 'recharts';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Cpu, MemoryStick, HardDrive, Network } from 'lucide-react';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -24,54 +26,25 @@ interface ResourceMonitoringProps {
   isRunning: boolean;
 }
 
-interface MetricData {
-  time: string;
-  cpu: {
-    usage: number;
-  };
-  memory: {
-    used: number;
-    total: number;
-    cache: number;
-  };
-  disk: {
-    read_bytes: number;
-    write_bytes: number;
-    read_ops: number;
-    write_ops: number;
-    read_speed: number;
-    write_speed: number;
-  };
-  network: {
-    rx_bytes: number;
-    tx_bytes: number;
-    rx_packets: number;
-    tx_packets: number;
-    rx_speed: number;
-    tx_speed: number;
-  };
-}
+// ... (keep existing interfaces as they are)
 
-interface FlattenedMetric {
-  time: string;
-  cpuUsage: number;
-  memoryUsed: number;
-  diskReadSpeed: number;
-  diskWriteSpeed: number;
-  networkRxSpeed: number;
-  networkTxSpeed: number;
-}
+const TIME_RANGES = {
+  '30s': { label: '30 seconds', value: 30 },
+  '60s': { label: '1 minute', value: 60 },
+  '5m': { label: '5 minutes', value: 300 }
+};
 
 const ChartTooltip = ({ active, payload, label, valueFormatter }) => {
   if (!active || !payload) return null;
   
   return (
-    <div className="rounded-lg bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/85 p-2 shadow-lg border border-border">
-      <p className="text-sm font-medium text-foreground">
+    <div className="rounded-lg bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/85 p-3 shadow-lg border border-border">
+      <p className="text-sm font-medium text-foreground mb-1">
         {new Date(label).toLocaleTimeString()}
       </p>
       {payload.map((entry, index) => (
-        <p key={index} className="text-sm" style={{ color: entry.color }}>
+        <p key={index} className="text-sm flex items-center gap-2" style={{ color: entry.color }}>
+          <span className="w-3 h-0.5 inline-block" style={{ backgroundColor: entry.color }}></span>
           {`${entry.name}: ${valueFormatter(entry.value)}`}
         </p>
       ))}
@@ -83,13 +56,14 @@ export default function ResourceMonitoring({ vpsId, isRunning }: ResourceMonitor
   const [metrics, setMetrics] = useState<MetricData[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [timeRange, setTimeRange] = useState('30s');
 
   const recentMetrics = useMemo(() => {
-    return metrics.slice(-30).map((metric, index, array) => {
+    const maxDataPoints = TIME_RANGES[timeRange].value;
+    return metrics.slice(-maxDataPoints).map((metric, index, array) => {
       const smoothingFactor = 0.3;
       const previousMetric = array[index - 1];
       
-      // Smooth out the values using exponential smoothing
       const smoothValue = (current: number, previous: number) => 
         previousMetric ? current * smoothingFactor + previous * (1 - smoothingFactor) : current;
 
@@ -103,7 +77,7 @@ export default function ResourceMonitoring({ vpsId, isRunning }: ResourceMonitor
         networkTxSpeed: smoothValue(metric.network.tx_speed, previousMetric?.network.tx_speed),
       };
     });
-  }, [metrics]);
+  }, [metrics, timeRange]);
 
   useEffect(() => {
     if (!isRunning) {
@@ -119,8 +93,8 @@ export default function ResourceMonitoring({ vpsId, isRunning }: ResourceMonitor
         const data = await getVPSMetrics(vpsId);
         if (mounted) {
           setMetrics(prev => {
-            // Ensure smooth transition by maintaining some history
-            const newData = [...prev.slice(-25), ...data.slice(-5)];
+            const maxDataPoints = TIME_RANGES['5m'].value; // Keep 5 minutes of data
+            const newData = [...prev.slice(-maxDataPoints), ...data.slice(-5)];
             return newData;
           });
           setError(null);
@@ -146,25 +120,25 @@ export default function ResourceMonitoring({ vpsId, isRunning }: ResourceMonitor
     };
   }, [vpsId, isRunning]);
 
-  if (!isRunning) {
-    return null;
-  }
-
+  if (!isRunning) return null;
   if (loading) {
     return (
-      <div className="grid gap-6 lg:grid-cols-2">
-        {[1, 2, 3, 4].map((i) => (
-          <Card key={i} className="transition-all duration-200 hover:shadow-lg">
-            <CardHeader>
-              <CardTitle>
-                <Skeleton className="h-6 w-32" />
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <Skeleton className="h-64 w-full" />
-            </CardContent>
-          </Card>
-        ))}
+      <div className="space-y-6">
+        <Skeleton className="h-10 w-48" />
+        <div className="grid gap-6 lg:grid-cols-2">
+          {[1, 2, 3, 4].map((i) => (
+            <Card key={i} className="transition-all duration-200">
+              <CardHeader>
+                <CardTitle>
+                  <Skeleton className="h-6 w-32" />
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <Skeleton className="h-64 w-full" />
+              </CardContent>
+            </Card>
+          ))}
+        </div>
       </div>
     );
   }
@@ -178,7 +152,7 @@ export default function ResourceMonitoring({ vpsId, isRunning }: ResourceMonitor
   }
 
   const chartCommonProps = {
-    margin: { top: 5, right: 5, left: 5, bottom: 5 },
+    margin: { top: 20, right: 30, left: 10, bottom: 5 },
     className: "transition-all duration-200",
   };
 
@@ -190,175 +164,199 @@ export default function ResourceMonitoring({ vpsId, isRunning }: ResourceMonitor
   };
 
   return (
-    <div className="grid gap-6 lg:grid-cols-2">
-      <Card className="transition-all duration-200 hover:shadow-lg">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Cpu className="h-5 w-5 text-blue-500" />
-            CPU Usage
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="h-64">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={recentMetrics} {...chartCommonProps}>
-                <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
-                <XAxis 
-                  dataKey="time"
-                  tickFormatter={(time) => new Date(time).toLocaleTimeString()}
-                  stroke="currentColor"
-                  opacity={0.5}
-                />
-                <YAxis 
-                  domain={[0, 100]} 
-                  tickFormatter={(value) => `${value}%`}
-                  stroke="currentColor"
-                  opacity={0.5}
-                />
-                <Tooltip content={<ChartTooltip valueFormatter={(value) => `${value.toFixed(1)}%`} />} />
-                <Line 
-                  type="monotone"
-                  dataKey="cpuUsage"
-                  stroke="#3b82f6"
-                  {...lineCommonProps}
-                />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
-        </CardContent>
-      </Card>
+    <div className="space-y-6">
+      <Tabs value={timeRange} onValueChange={setTimeRange} className="w-full">
+        <TabsList>
+          {Object.entries(TIME_RANGES).map(([key, { label }]) => (
+            <TabsTrigger key={key} value={key} className="min-w-24">
+              {label}
+            </TabsTrigger>
+          ))}
+        </TabsList>
+      </Tabs>
 
-      <Card className="transition-all duration-200 hover:shadow-lg">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <MemoryStick className="h-5 w-5 text-purple-500" />
-            Memory Usage
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="h-64">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={recentMetrics} {...chartCommonProps}>
-                <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
-                <XAxis 
-                  dataKey="time"
-                  tickFormatter={(time) => new Date(time).toLocaleTimeString()}
-                  stroke="currentColor"
-                  opacity={0.5}
-                />
-                <YAxis 
-                  tickFormatter={formatBytes}
-                  stroke="currentColor"
-                  opacity={0.5}
-                />
-                <Tooltip content={<ChartTooltip valueFormatter={formatBytes} />} />
-                <defs>
-                  <linearGradient id="memoryGradient" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#8b5cf6" stopOpacity={0.4}/>
-                    <stop offset="95%" stopColor="#8b5cf6" stopOpacity={0}/>
-                  </linearGradient>
-                </defs>
-                <Area
-                  type="monotone"
-                  dataKey="memoryUsed"
-                  stroke="#8b5cf6"
-                  fill="url(#memoryGradient)"
-                  isAnimationActive={true}
-                  animationDuration={300}
-                />
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
-        </CardContent>
-      </Card>
+      <div className="grid gap-6 lg:grid-cols-2">
+        <Card className="transition-all duration-200 hover:shadow-lg">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Cpu className="h-5 w-5 text-blue-500" />
+              CPU Usage
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="h-72">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={recentMetrics} {...chartCommonProps}>
+                  <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
+                  <XAxis 
+                    dataKey="time"
+                    tickFormatter={(time) => new Date(time).toLocaleTimeString()}
+                    stroke="currentColor"
+                    opacity={0.5}
+                    padding={{ left: 10, right: 10 }}
+                  />
+                  <YAxis 
+                    domain={[0, 100]} 
+                    tickFormatter={(value) => `${value}%`}
+                    stroke="currentColor"
+                    opacity={0.5}
+                    width={40}
+                  />
+                  <Tooltip content={<ChartTooltip valueFormatter={(value) => `${value.toFixed(1)}%`} />} />
+                  <Line 
+                    type="monotone"
+                    name="CPU Usage"
+                    dataKey="cpuUsage"
+                    stroke="#3b82f6"
+                    {...lineCommonProps}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          </CardContent>
+        </Card>
 
-      <Card className="transition-all duration-200 hover:shadow-lg">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <HardDrive className="h-5 w-5 text-green-500" />
-            Disk I/O
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="h-64">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={recentMetrics} {...chartCommonProps}>
-                <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
-                <XAxis 
-                  dataKey="time"
-                  tickFormatter={(time) => new Date(time).toLocaleTimeString()}
-                  stroke="currentColor"
-                  opacity={0.5}
-                />
-                <YAxis 
-                  tickFormatter={(value) => formatBytes(value) + '/s'}
-                  stroke="currentColor"
-                  opacity={0.5}
-                />
-                <Tooltip content={<ChartTooltip valueFormatter={(value) => formatBytes(value) + '/s'} />} />
-                <Line 
-                  type="monotone"
-                  name="Read"
-                  dataKey="diskReadSpeed"
-                  stroke="#22c55e"
-                  {...lineCommonProps}
-                />
-                <Line 
-                  type="monotone"
-                  name="Write"
-                  dataKey="diskWriteSpeed"
-                  stroke="#15803d"
-                  {...lineCommonProps}
-                />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
-        </CardContent>
-      </Card>
+        <Card className="transition-all duration-200 hover:shadow-lg">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <MemoryStick className="h-5 w-5 text-purple-500" />
+              Memory Usage
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="h-72">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={recentMetrics} {...chartCommonProps}>
+                  <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
+                  <XAxis 
+                    dataKey="time"
+                    tickFormatter={(time) => new Date(time).toLocaleTimeString()}
+                    stroke="currentColor"
+                    opacity={0.5}
+                    padding={{ left: 10, right: 10 }}
+                  />
+                  <YAxis 
+                    tickFormatter={formatBytes}
+                    stroke="currentColor"
+                    opacity={0.5}
+                    width={60}
+                  />
+                  <Tooltip content={<ChartTooltip valueFormatter={formatBytes} />} />
+                  <defs>
+                    <linearGradient id="memoryGradient" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#8b5cf6" stopOpacity={0.4}/>
+                      <stop offset="95%" stopColor="#8b5cf6" stopOpacity={0}/>
+                    </linearGradient>
+                  </defs>
+                  <Area
+                    type="monotone"
+                    name="Memory Usage"
+                    dataKey="memoryUsed"
+                    stroke="#8b5cf6"
+                    fill="url(#memoryGradient)"
+                    isAnimationActive={true}
+                    animationDuration={300}
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+          </CardContent>
+        </Card>
 
-      <Card className="transition-all duration-200 hover:shadow-lg">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Network className="h-5 w-5 text-orange-500" />
-            Network Traffic
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="h-64">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={recentMetrics} {...chartCommonProps}>
-                <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
-                <XAxis 
-                  dataKey="time"
-                  tickFormatter={(time) => new Date(time).toLocaleTimeString()}
-                  stroke="currentColor"
-                  opacity={0.5}
-                />
-                <YAxis 
-                  tickFormatter={formatBitrate}
-                  stroke="currentColor"
-                  opacity={0.5}
-                />
-                <Tooltip content={<ChartTooltip valueFormatter={formatBitrate} />} />
-                <Line 
-                  type="monotone"
-                  name="Download"
-                  dataKey="networkRxSpeed"
-                  stroke="#f97316"
-                  {...lineCommonProps}
-                />
-                <Line 
-                  type="monotone"
-                  name="Upload"
-                  dataKey="networkTxSpeed"
-                  stroke="#ea580c"
-                  {...lineCommonProps}
-                />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
-        </CardContent>
-      </Card>
+        <Card className="transition-all duration-200 hover:shadow-lg">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <HardDrive className="h-5 w-5 text-green-500" />
+              Disk I/O
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="h-72">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={recentMetrics} {...chartCommonProps}>
+                  <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
+                  <XAxis 
+                    dataKey="time"
+                    tickFormatter={(time) => new Date(time).toLocaleTimeString()}
+                    stroke="currentColor"
+                    opacity={0.5}
+                    padding={{ left: 10, right: 10 }}
+                  />
+                  <YAxis 
+                    tickFormatter={(value) => formatBytes(value) + '/s'}
+                    stroke="currentColor"
+                    opacity={0.5}
+                    width={70}
+                  />
+                  <Tooltip content={<ChartTooltip valueFormatter={(value) => formatBytes(value) + '/s'} />} />
+                  <Legend />
+                  <Line 
+                    type="monotone"
+                    name="Read"
+                    dataKey="diskReadSpeed"
+                    stroke="#22c55e"
+                    {...lineCommonProps}
+                  />
+                  <Line 
+                    type="monotone"
+                    name="Write"
+                    dataKey="diskWriteSpeed"
+                    stroke="#15803d"
+                    {...lineCommonProps}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="transition-all duration-200 hover:shadow-lg">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Network className="h-5 w-5 text-orange-500" />
+              Network Traffic
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="h-72">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={recentMetrics} {...chartCommonProps}>
+                  <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
+                  <XAxis 
+                    dataKey="time"
+                    tickFormatter={(time) => new Date(time).toLocaleTimeString()}
+                    stroke="currentColor"
+                    opacity={0.5}
+                    padding={{ left: 10, right: 10 }}
+                  />
+                  <YAxis 
+                    tickFormatter={formatBitrate}
+                    stroke="currentColor"
+                    opacity={0.5}
+                    width={70}
+                  />
+                  <Tooltip content={<ChartTooltip valueFormatter={formatBitrate} />} />
+                  <Legend />
+                  <Line 
+                    type="monotone"
+                    name="Download"
+                    dataKey="networkRxSpeed"
+                    stroke="#f97316"
+                    {...lineCommonProps}
+                  />
+                  <Line 
+                    type="monotone"
+                    name="Upload"
+                    dataKey="networkTxSpeed"
+                    stroke="#ea580c"
+                    {...lineCommonProps}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
     </div>
   );
 }

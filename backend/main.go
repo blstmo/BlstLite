@@ -3,11 +3,13 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -505,6 +507,7 @@ func (m *VPSManager) createVPSWithProgress(vps *VPS) error {
     updateProgress(StageStartingQEMU, 80)
     pidFile := filepath.Join(instanceDir, "qemu.pid")
     logFile := filepath.Join(m.baseDir, "logs", fmt.Sprintf("%s.log", vps.ID))
+    monitorSocket := filepath.Join(instanceDir, "qemu-monitor.sock")
 
     args := []string{
         "-name", fmt.Sprintf("guest=%s,debug-threads=on", vps.Name),
@@ -515,16 +518,17 @@ func (m *VPSManager) createVPSWithProgress(vps *VPS) error {
         "-drive", fmt.Sprintf("file=%s,format=qcow2", vps.ImagePath),
         "-drive", fmt.Sprintf("file=%s,format=raw", cloudInitPath),
         "-vnc", fmt.Sprintf("0.0.0.0:%d", vps.VNCPort-5900),
-        "-device", "virtio-net-pci,netdev=user0",
-        "-monitor", fmt.Sprintf("unix:%s,server,nowait", filepath.Join(instanceDir, "qemu-monitor.sock")),
+        "-device", fmt.Sprintf("virtio-net-pci,netdev=net0,mac=%s", generateMacAddress(vps.ID)),
         "-netdev", fmt.Sprintf(
-            "user,id=user0,hostfwd=tcp:0.0.0.0:%d-:22",
+            "user,id=net0,hostfwd=tcp:0.0.0.0:%d-:22",
             vps.SSHPort,
         ),
+        "-qmp", fmt.Sprintf("unix:%s,server,nowait", monitorSocket),
         "-pidfile", pidFile,
         "-daemonize",
         "-enable-kvm",
     }
+
 
     cmd := exec.Command("qemu-system-x86_64", args...)
     
@@ -745,7 +749,7 @@ func (m *VPSManager) StartVPS(id string) error {
             "user,id=user0,hostfwd=tcp:0.0.0.0:%d-:22",
             vps.SSHPort,
         ),
-        "-monitor", fmt.Sprintf("unix:%s,server,nowait", monitorSocket),
+        "-qmp", fmt.Sprintf("unix:%s,server,nowait", monitorSocket),
         "-pidfile", pidFile,
         "-daemonize",
         "-enable-kvm",
@@ -1277,6 +1281,18 @@ func (m *VPSManager) metricsCollector() {
     }
 }
 
+func generateMacAddress(id string) string {
+    // Use first 6 bytes of UUID as MAC address
+    cleanID := strings.ReplaceAll(id, "-", "")
+    if len(cleanID) < 12 {
+        cleanID = cleanID + strings.Repeat("0", 12-len(cleanID))
+    }
+    return fmt.Sprintf("52:54:00:%s:%s:%s",
+        cleanID[0:2],
+        cleanID[2:4],
+        cleanID[4:6])
+}
+
 func (m *VPSManager) collectMetrics(id string) (*ResourceMetrics, error) {
     m.mutex.RLock()
     vps, exists := m.instances[id]
@@ -1367,7 +1383,12 @@ func (m *VPSManager) collectMetrics(id string) (*ResourceMetrics, error) {
         }
     }
 
-    // Get network stats using ip link
+    instanceDir := filepath.Join(m.baseDir, "disks", id)
+    monitorSocket := filepath.Join(instanceDir, "qemu-monitor.sock")
+    
+    log.Printf("[NetworkMetrics] Starting network metrics collection for VPS %s", id)
+    
+    // Initialize network metrics
     metrics.Network = NetworkMetrics{
         RXBytes:   0,
         TXBytes:   0,
@@ -1377,90 +1398,155 @@ func (m *VPSManager) collectMetrics(id string) (*ResourceMetrics, error) {
         TXSpeed:   0,
     }
 
-    // Find the tap device for this VPS
-    cmd := exec.Command("ip", "link", "show")
-    output, err := cmd.Output()
-    if err == nil {
-        scanner := bufio.NewScanner(strings.NewReader(string(output)))
-        var currentIface string
-        for scanner.Scan() {
-            line := scanner.Text()
-            if strings.Contains(line, fmt.Sprintf("tap%d", vps.QEMUPid)) {
-                currentIface = fmt.Sprintf("tap%d", vps.QEMUPid)
-                break
+    // First, get the list of PCI devices
+    pciListCmd := `{ "execute": "qom-list", "arguments": {"path": "/machine/i440fx/pci.0"} }`
+    if output, err := m.executeQMPCommand(monitorSocket, pciListCmd); err == nil {
+        log.Printf("[NetworkMetrics] PCI devices list: %s", string(output))
+
+        // Try to find our network device
+        netDevCmd := `{ "execute": "qom-list", "arguments": {"path": "/machine/i440fx/pci.0/virtio-net-pci.0"} }`
+        if netOutput, err := m.executeQMPCommand(monitorSocket, netDevCmd); err == nil {
+            log.Printf("[NetworkMetrics] Network device properties: %s", string(netOutput))
+
+            // Get the device properties
+            statsCmd := `{ "execute": "qom-get", "arguments": {"path": "/machine/i440fx/pci.0/virtio-net-pci.0", "property": "host_features"} }`
+            if statsOutput, err := m.executeQMPCommand(monitorSocket, statsCmd); err == nil {
+                log.Printf("[NetworkMetrics] Network device stats: %s", string(statsOutput))
+            }
+
+            // Try alternative stats command
+            altStatsCmd := `{ "execute": "query-rx-filter", "arguments": {"name": "net0"} }`
+            if statsOutput, err := m.executeQMPCommand(monitorSocket, altStatsCmd); err == nil {
+                log.Printf("[NetworkMetrics] RX filter stats: %s", string(statsOutput))
             }
         }
 
-        if currentIface != "" {
-            if stats, err := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/statistics/rx_bytes", currentIface)); err == nil {
-                metrics.Network.RXBytes, _ = strconv.ParseInt(strings.TrimSpace(string(stats)), 10, 64)
-            }
-            if stats, err := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/statistics/tx_bytes", currentIface)); err == nil {
-                metrics.Network.TXBytes, _ = strconv.ParseInt(strings.TrimSpace(string(stats)), 10, 64)
-            }
-            if stats, err := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/statistics/rx_packets", currentIface)); err == nil {
-                metrics.Network.RXPackets, _ = strconv.ParseInt(strings.TrimSpace(string(stats)), 10, 64)
-            }
-            if stats, err := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/statistics/tx_packets", currentIface)); err == nil {
-                metrics.Network.TXPackets, _ = strconv.ParseInt(strings.TrimSpace(string(stats)), 10, 64)
+        // Try querying netdev directly
+        netdevCmd := `{ "execute": "query-netdev" }`
+        if netdevOutput, err := m.executeQMPCommand(monitorSocket, netdevCmd); err == nil {
+            log.Printf("[NetworkMetrics] Netdev info: %s", string(netdevOutput))
+        }
+    }
+
+    // If we still don't have stats, try reading from /proc
+    if metrics.Network.RXBytes == 0 {
+        m.mutex.RLock()
+        vps, exists := m.instances[id]
+        m.mutex.RUnlock()
+
+        if exists && vps.QEMUPid > 0 {
+            // Try to read network stats from /proc/[pid]/net/dev
+            if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/net/dev", vps.QEMUPid)); err == nil {
+                scanner := bufio.NewScanner(bytes.NewReader(data))
+                for scanner.Scan() {
+                    line := scanner.Text()
+                    if strings.Contains(line, "eth0:") || strings.Contains(line, "ens3:") {
+                        fields := strings.Fields(line)
+                        if len(fields) >= 17 {
+                            metrics.Network.RXBytes, _ = strconv.ParseInt(fields[1], 10, 64)
+                            metrics.Network.RXPackets, _ = strconv.ParseInt(fields[2], 10, 64)
+                            metrics.Network.TXBytes, _ = strconv.ParseInt(fields[9], 10, 64)
+                            metrics.Network.TXPackets, _ = strconv.ParseInt(fields[10], 10, 64)
+                            log.Printf("[NetworkMetrics] Found network stats in /proc/net/dev")
+                            break
+                        }
+                    }
+                }
             }
         }
     }
 
-    // Get the metrics cache for this VPS
+    // Calculate speeds using the metrics cache
     m.metricsMutex.Lock()
     cache, exists := m.metricsCache[id]
     if exists && !cache.LastUpdate.IsZero() {
-        // Calculate speeds based on the time difference
         duration := metrics.Time.Sub(cache.LastUpdate).Seconds()
         if duration > 0 {
-            // Calculate disk speeds
-            metrics.Disk.ReadSpeed = float64(metrics.Disk.ReadBytes-cache.LastDiskStats.ReadBytes) / duration
-            metrics.Disk.WriteSpeed = float64(metrics.Disk.WriteBytes-cache.LastDiskStats.WriteBytes) / duration
-            
-            // Calculate network speeds
             metrics.Network.RXSpeed = float64(metrics.Network.RXBytes-cache.LastNetStats.RXBytes) / duration
             metrics.Network.TXSpeed = float64(metrics.Network.TXBytes-cache.LastNetStats.TXBytes) / duration
+            log.Printf("[NetworkMetrics] Calculated speeds - RX: %.2f bytes/sec, TX: %.2f bytes/sec",
+                metrics.Network.RXSpeed, metrics.Network.TXSpeed)
         }
     }
     m.metricsMutex.Unlock()
+
+    log.Printf("[NetworkMetrics] Final metrics for VPS %s:", id)
+    log.Printf("[NetworkMetrics] RX Bytes: %d", metrics.Network.RXBytes)
+    log.Printf("[NetworkMetrics] TX Bytes: %d", metrics.Network.TXBytes)
+    log.Printf("[NetworkMetrics] RX Packets: %d", metrics.Network.RXPackets)
+    log.Printf("[NetworkMetrics] TX Packets: %d", metrics.Network.TXPackets)
 
     return metrics, nil
 }
 
 func (m *VPSManager) executeQMPCommand(socket, command string) ([]byte, error) {
-    tmpFile, err := os.CreateTemp("", "qmp-*")
-    if err != nil {
-        return nil, err
-    }
-    defer os.Remove(tmpFile.Name())
-
-    cmd := exec.Command("echo", command)
-    socat := exec.Command("socat", "-", fmt.Sprintf("UNIX-CONNECT:%s", socket))
+    log.Printf("[QMP] Connecting to socket: %s", socket)
     
-    socatIn, err := socat.StdinPipe()
+    conn, err := net.Dial("unix", socket)
     if err != nil {
-        return nil, err
+        log.Printf("[QMP] Failed to connect to socket: %v", err)
+        return nil, fmt.Errorf("failed to connect to QMP socket: %v", err)
     }
+    defer conn.Close()
+
+    // Read the greeting
+    greeting := make([]byte, 1024)
+    n, err := conn.Read(greeting)
+    if err != nil {
+        log.Printf("[QMP] Failed to read greeting: %v", err)
+        return nil, fmt.Errorf("failed to read QMP greeting: %v", err)
+    }
+    log.Printf("[QMP] Received greeting: %s", string(greeting[:n]))
+
+    // First, switch to JSON mode
+    jsonMode := `{ "execute": "qmp_capabilities" }` + "\n"
+    if _, err := conn.Write([]byte(jsonMode)); err != nil {
+        log.Printf("[QMP] Failed to send JSON mode command: %v", err)
+        return nil, fmt.Errorf("failed to send JSON mode command: %v", err)
+    }
+
+    // Read and discard the response
+    buf := make([]byte, 1024)
+    if _, err := conn.Read(buf); err != nil {
+        log.Printf("[QMP] Failed to read JSON mode response: %v", err)
+        return nil, fmt.Errorf("failed to read JSON mode response: %v", err)
+    }
+
+    // Send the actual command with a newline
+    fullCommand := command + "\n"
+    log.Printf("[QMP] Sending command: %s", command)
+    if _, err := conn.Write([]byte(fullCommand)); err != nil {
+        log.Printf("[QMP] Failed to send command: %v", err)
+        return nil, fmt.Errorf("failed to send command: %v", err)
+    }
+
+    // Read the response with a larger buffer
+    response := make([]byte, 4096)
+    n, err = conn.Read(response)
+    if err != nil {
+        log.Printf("[QMP] Failed to read command response: %v", err)
+        return nil, fmt.Errorf("failed to read command response: %v", err)
+    }
+
+    // Try to find the complete JSON response
+    respStr := string(response[:n])
+    log.Printf("[QMP] Raw response: %s", respStr)
+
+    // Look for complete JSON object
+    start := strings.Index(respStr, "{")
+    end := strings.LastIndex(respStr, "}")
     
-    cmd.Stdout = socatIn
-    socat.Stdout = tmpFile
-
-    if err := socat.Start(); err != nil {
-        return nil, err
+    if start == -1 || end == -1 || start > end {
+        log.Printf("[QMP] Invalid JSON response format")
+        return nil, fmt.Errorf("invalid JSON response format")
     }
 
-    if err := cmd.Run(); err != nil {
-        return nil, err
-    }
-
-    socatIn.Close()
-    if err := socat.Wait(); err != nil {
-        return nil, err
-    }
-
-    return os.ReadFile(tmpFile.Name())
+    jsonResponse := respStr[start:end+1]
+    log.Printf("[QMP] Extracted JSON: %s", jsonResponse)
+    
+    return []byte(jsonResponse), nil
 }
+
 
 func (m *VPSManager) updateMetricsCache(id string, metrics *ResourceMetrics) {
     m.metricsMutex.Lock()
@@ -1526,7 +1612,7 @@ func (m *VPSManager) handleGetMetrics(w http.ResponseWriter, r *http.Request) {
     json.NewEncoder(w).Encode(cache.MetricsHistory)
 }
 
-// Add these methods to your VPSManager struct
+
 
 func (m *VPSManager) parseCPUMetrics(data []byte) CPUMetrics {
     var cpuMetrics CPUMetrics
