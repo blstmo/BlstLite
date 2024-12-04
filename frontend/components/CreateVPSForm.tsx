@@ -1,17 +1,21 @@
+'use client'
+
 import React, { useState, useEffect } from 'react';
 import { VPS } from '@/types/vps';
+import { createVPS, checkVPSProgress, getVPSDetails, getAvailableImages } from '../app/actions';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Card } from '@/components/ui/card';
-import { ChevronDown, ChevronUp, Shuffle } from 'lucide-react';
+import { ChevronDown, ChevronUp, Shuffle, Loader2 } from 'lucide-react';
 import {
   Accordion,
   AccordionContent,
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
+import { Progress } from "@/components/ui/progress";
 
 interface CreateVPSFormProps {
   onSuccess: (vps: VPS) => void;
@@ -26,6 +30,23 @@ interface OSImage {
   version: number;
 }
 
+interface VPSProgress {
+  stage: string;
+  progress: number;
+  status: string;
+  error?: string;
+}
+
+const STAGE_MESSAGES = {
+  initializing: 'Initializing your VPS...',
+  creating_disk: 'Creating disk image...',
+  preparing_cloud_init: 'Preparing cloud configuration...',
+  starting_qemu: 'Starting virtual machine...',
+  configuring_vnc: 'Configuring remote access...',
+  completed: 'Setup completed!',
+  failed: 'Creation failed'
+};
+
 export default function CreateVPSForm({ onSuccess }: CreateVPSFormProps) {
   const [name, setName] = useState('');
   const [hostname, setHostname] = useState('');
@@ -33,6 +54,8 @@ export default function CreateVPSForm({ onSuccess }: CreateVPSFormProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [availableImages, setAvailableImages] = useState<OSImage[]>([]);
+  const [creationProgress, setCreationProgress] = useState<VPSProgress | null>(null);
+  const [vpsId, setVpsId] = useState<string | null>(null);
   
   // List of adjectives and nouns for random name generation
   const adjectives = ['swift', 'brave', 'mighty', 'cosmic', 'stellar', 'noble', 'rapid', 'clever', 'nimble', 'radiant'];
@@ -47,7 +70,6 @@ export default function CreateVPSForm({ onSuccess }: CreateVPSFormProps) {
     setHostname(`${generatedName}.vps.local`);
   };
 
-  // Rest of the helper functions remain the same
   const parseVersion = (version: string): number => {
     const match = version.match(/\d+(\.\d+)?/);
     return match ? parseFloat(match[0]) : 0;
@@ -89,10 +111,7 @@ export default function CreateVPSForm({ onSuccess }: CreateVPSFormProps) {
   useEffect(() => {
     const fetchImages = async () => {
       try {
-        const response = await fetch('/api/vps/images');
-        if (!response.ok) throw new Error('Failed to fetch available images');
-        
-        const imageIds: string[] = await response.json();
+        const imageIds = await getAvailableImages();
         const formattedImages = imageIds.map(getOSDetails);
         
         const categoryOrder = ['Ubuntu', 'Debian', 'Fedora', 'Enterprise Linux', 'Other'];
@@ -127,33 +146,59 @@ export default function CreateVPSForm({ onSuccess }: CreateVPSFormProps) {
     fetchImages();
   }, []);
 
+  useEffect(() => {
+    let progressInterval: NodeJS.Timeout;
+
+    if (vpsId && loading) {
+      progressInterval = setInterval(async () => {
+        try {
+          const progressData = await checkVPSProgress(vpsId);
+          setCreationProgress(progressData);
+          
+          if (progressData.status === 'running' || progressData.stage === 'completed') {
+            clearInterval(progressInterval);
+            const vpsData = await getVPSDetails(vpsId);
+            setLoading(false);
+            onSuccess(vpsData);
+          } else if (progressData.stage === 'failed') {
+            clearInterval(progressInterval);
+            setLoading(false);
+            setError(progressData.error || 'VPS creation failed');
+          }
+        } catch (err) {
+          console.error('Failed to fetch progress:', err);
+          clearInterval(progressInterval);
+          setLoading(false);
+          setError('Failed to check VPS progress');
+        }
+      }, 2000);
+    }
+
+    return () => {
+      if (progressInterval) {
+        clearInterval(progressInterval);
+      }
+    };
+  }, [vpsId, loading, onSuccess]);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setError('');
+    setCreationProgress(null);
+    setVpsId(null);
 
     try {
-      const response = await fetch('/api/vps/create', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          name, 
-          hostname,
-          image_type: selectedImage 
-        }),
+      const data = await createVPS({
+        name,
+        hostname,
+        image_type: selectedImage
       });
-
-      const data = await response.json();
       
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to create VPS');
-      }
-
-      onSuccess(data);
+      setVpsId(data.id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to create VPS');
-    } finally {
       setLoading(false);
+      setError(err instanceof Error ? err.message : 'Failed to create VPS');
     }
   };
 
@@ -255,8 +300,29 @@ export default function CreateVPSForm({ onSuccess }: CreateVPSFormProps) {
         </Alert>
       )}
 
-      <Button type="submit" disabled={loading} className="w-full">
-        {loading ? 'Creating...' : 'Create VPS'}
+      {loading && creationProgress && (
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <div className="space-y-1">
+              <p className="text-sm font-medium">
+                {STAGE_MESSAGES[creationProgress.stage as keyof typeof STAGE_MESSAGES]}
+              </p>
+              <p className="text-sm text-muted-foreground">
+                {creationProgress.stage.replace(/_/g, ' ')}
+              </p>
+            </div>
+            <Loader2 className="h-4 w-4 animate-spin" />
+          </div>
+          <Progress value={creationProgress.progress} className="h-2" />
+        </div>
+      )}
+
+      <Button 
+        type="submit" 
+        disabled={loading} 
+        className="w-full"
+      >
+        {loading ? 'Creating VPS...' : 'Create VPS'}
       </Button>
     </form>
   );

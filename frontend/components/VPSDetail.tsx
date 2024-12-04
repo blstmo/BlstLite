@@ -1,4 +1,6 @@
-import { useEffect, useRef } from 'react';
+'use client'
+
+import { useEffect, useRef, useState } from 'react';
 import { VPSBackend } from '@/types/vps';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -11,12 +13,12 @@ import {
   Server,
   Network,
   Globe,
-  Copy
+  Copy,
+  AlertTriangle
 } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { CountdownTimer } from '@/components/countdown-timer';
-import { toast } from 'sonner';
 
 interface VPSDetailProps {
   vps: VPSBackend;
@@ -27,6 +29,7 @@ export default function VPSDetail({ vps, onClose }: VPSDetailProps) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const backendUrl = process.env.NEXT_PUBLIC_API_URL;
   const backendHost = backendUrl ? backendUrl.split('//')[1].split(':')[0] : '';
+  const [copyAlert, setCopyAlert] = useState<string | null>(null);
 
   useEffect(() => {
     if (!backendUrl) {
@@ -52,9 +55,19 @@ export default function VPSDetail({ vps, onClose }: VPSDetailProps) {
     }
   }, [vps, backendUrl, backendHost]);
 
+  useEffect(() => {
+    if (copyAlert) {
+      const timer = setTimeout(() => setCopyAlert(null), 2000);
+      return () => clearTimeout(timer);
+    }
+  }, [copyAlert]);
+
   const copyToClipboard = (text: string, description: string) => {
-    navigator.clipboard.writeText(text);
-    toast.success(`${description} copied to clipboard`);
+    navigator.clipboard.writeText(text).then(() => {
+      setCopyAlert(description);
+    }).catch(err => {
+      console.error('Failed to copy:', err);
+    });
   };
 
   const sshCommand = `ssh root@${backendHost} -p ${vps.ssh_port}`;
@@ -67,18 +80,26 @@ export default function VPSDetail({ vps, onClose }: VPSDetailProps) {
         return 'warning';
       case 'stopped':
         return 'destructive';
+      case 'failed':
+        return 'destructive';
       default:
         return 'secondary';
     }
   };
 
   return (
-    <div className="space-y-6 p-6 bg-background rounded-lg shadow-lg">
+    <div className="space-y-6 p-6 bg-background rounded-lg shadow-lg relative">
+      {copyAlert && (
+        <div className="absolute top-4 right-4 bg-green-500 text-white px-4 py-2 rounded-md animate-in fade-in slide-in-from-top-1">
+          {copyAlert} copied to clipboard
+        </div>
+      )}
+
       <div className="flex justify-between items-center">
         <div className="space-y-2">
-          <h2 className="text-3xl font-bold">{vps.name}</h2>
+          <h2 className="text-3xl font-bold tracking-tight">{vps.name}</h2>
           <div className="flex items-center gap-4">
-            <Badge variant={getStatusColor(vps.status)}>
+            <Badge variant={getStatusColor(vps.status)} className="capitalize">
               {vps.status}
             </Badge>
             <span className="text-muted-foreground text-sm">
@@ -92,13 +113,23 @@ export default function VPSDetail({ vps, onClose }: VPSDetailProps) {
         </Button>
       </div>
 
+      {vps.status === 'failed' && (
+        <Alert variant="destructive">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertTitle>Instance Failed</AlertTitle>
+          <AlertDescription>
+            This instance has failed to start properly. You may want to delete it and create a new one.
+          </AlertDescription>
+        </Alert>
+      )}
+
       <div className="grid gap-6 lg:grid-cols-2">
         <Alert>
           <Globe className="h-5 w-5" />
           <AlertTitle>Hostname Details</AlertTitle>
           <AlertDescription className="mt-2 space-y-2">
-            <div className="flex items-center justify-between bg-muted p-2 rounded">
-              <code className="text-sm">{vps.hostname}</code>
+            <div className="flex items-center justify-between bg-muted/50 p-2 rounded">
+              <code className="text-sm font-mono">{vps.hostname}</code>
               <Button
                 variant="ghost"
                 size="icon"
@@ -114,7 +145,7 @@ export default function VPSDetail({ vps, onClose }: VPSDetailProps) {
           <Key className="h-5 w-5" />
           <AlertTitle>System Credentials</AlertTitle>
           <AlertDescription>
-            <div className="mt-2 space-y-2 bg-muted p-3 rounded font-mono text-sm">
+            <div className="mt-2 space-y-2 bg-muted/50 p-3 rounded font-mono text-sm">
               <div className="flex justify-between items-center">
                 <span>Username: root</span>
                 <Button
@@ -141,9 +172,9 @@ export default function VPSDetail({ vps, onClose }: VPSDetailProps) {
 
         <Alert variant="warning">
           <Clock className="h-5 w-5" />
-          <AlertTitle>Expiration</AlertTitle>
+          <AlertTitle>Instance Expiration</AlertTitle>
           <AlertDescription>
-            <p className="mt-2 font-semibold">
+            <p className="mt-2 font-medium">
               Expires at {new Date(vps.expires_at).toLocaleString()}
             </p>
             <CountdownTimer expiresAt={vps.expires_at} />
@@ -154,12 +185,13 @@ export default function VPSDetail({ vps, onClose }: VPSDetailProps) {
           <Network className="h-5 w-5" />
           <AlertTitle>SSH Connection</AlertTitle>
           <AlertDescription>
-            <div className="mt-2 bg-muted p-3 rounded font-mono text-sm">
-              <div className="flex justify-between items-center">
+            <div className="mt-2 bg-muted/50 p-3 rounded font-mono text-sm">
+              <div className="flex justify-between items-center break-all">
                 <code>{sshCommand}</code>
                 <Button
                   variant="ghost"
                   size="icon"
+                  className="ml-2 flex-shrink-0"
                   onClick={() => copyToClipboard(sshCommand, 'SSH command')}
                 >
                   <Copy className="h-4 w-4" />
@@ -178,7 +210,7 @@ export default function VPSDetail({ vps, onClose }: VPSDetailProps) {
           </CardTitle>
         </CardHeader>
         <CardContent className="p-0">
-          <div className="w-full h-[600px] bg-black rounded-lg overflow-hidden shadow-inner">
+          <div className="w-full aspect-video bg-black rounded-lg overflow-hidden shadow-inner">
             <iframe
               ref={iframeRef}
               className="w-full h-full border-0"
@@ -199,11 +231,11 @@ export default function VPSDetail({ vps, onClose }: VPSDetailProps) {
           <div className="grid grid-cols-2 md:grid-cols-3 gap-4 text-sm">
             <div>
               <p className="font-medium text-muted-foreground">VNC Port</p>
-              <p>{vps.vnc_port}</p>
+              <p className="font-mono">{vps.vnc_port}</p>
             </div>
             <div>
               <p className="font-medium text-muted-foreground">SSH Port</p>
-              <p>{vps.ssh_port}</p>
+              <p className="font-mono">{vps.ssh_port}</p>
             </div>
             <div>
               <p className="font-medium text-muted-foreground">Created At</p>
