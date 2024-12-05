@@ -33,6 +33,7 @@ const (
     StagePreparingCloudInit = "preparing_cloud_init"
     StageStartingQEMU     = "starting_qemu"
     StageConfigVNC        = "configuring_vnc"
+    StageInstallingTemplate = "installing_template" // New stage
     StageCompleted        = "completed"
     StageFailed          = "failed"
 
@@ -72,6 +73,7 @@ const (
     StatusStarting   = "starting"
     StatusStopping   = "stopping"
     StatusRestarting = "restarting"
+    
 )
 
 var SUPPORTED_IMAGES = map[string]string{
@@ -105,6 +107,7 @@ type VPS struct {
     Hostname    string    `json:"hostname"`
     Status      string    `json:"status"`
     ImageType   string    `json:"image_type"`
+    Template    string    `json:"template"`        // Add template to VPS struct
     QEMUPid     int       `json:"qemu_pid,omitempty"`
     VNCPort     int       `json:"vnc_port"`
     SSHPort     int       `json:"ssh_port"`
@@ -115,6 +118,16 @@ type VPS struct {
     Stage       string    `json:"stage"`           // Current stage of creation
     Progress    int       `json:"progress"`        // Progress percentage (0-100)
     ErrorMsg    string    `json:"error,omitempty"` // Error message if something fails
+}
+
+
+type VPSTemplate struct {
+    ID          string            `json:"id"`
+    Name        string            `json:"name"`
+    Description string            `json:"description"`
+    OSVariants  []string         `json:"os_variants"`     // Supported OS images
+    Packages    map[string][]string `json:"packages"`     // OS-specific packages
+    Commands    map[string][]string `json:"commands"`     // OS-specific commands
 }
 
 type VPSManager struct {
@@ -134,6 +147,263 @@ type MetricsCache struct {
     LastDiskStats  DiskMetrics
     LastNetStats   NetworkMetrics
     MetricsHistory []ResourceMetrics
+}
+
+
+var SUPPORTED_TEMPLATES = map[string]VPSTemplate{
+    "blank": {
+        ID:          "blank",
+        Name:        "Blank Server",
+        Description: "Basic server with no additional software",
+        OSVariants:  []string{"ubuntu-22.04", "ubuntu-20.04", "debian-12", "debian-11", "fedora-40", "fedora-38", "rocky-9", "rocky-8", "almalinux-9", "almalinux-8", "centos-9", "centos-7"},
+    },
+    "docker": {
+        ID:          "docker",
+        Name:        "Docker Development Environment",
+        Description: "Server with Docker and Docker Compose pre-installed",
+        OSVariants:  []string{"ubuntu-22.04", "ubuntu-20.04", "debian-12", "debian-11", "fedora-40", "fedora-38", "rocky-9", "rocky-8", "almalinux-9", "almalinux-8", "centos-9", "centos-7"},
+        Packages: map[string][]string{
+            "ubuntu": {"apt-transport-https", "ca-certificates", "curl", "software-properties-common"},
+            "debian": {"apt-transport-https", "ca-certificates", "curl", "software-properties-common"},
+            "fedora": {"dnf-plugins-core", "curl"},
+            "rocky":  {"yum-utils", "epel-release"},
+            "almalinux": {"yum-utils", "epel-release"},
+            "centos": {"yum-utils", "epel-release"},
+        },
+        Commands: map[string][]string{
+            "ubuntu": {
+                "curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -",
+                "add-apt-repository \"deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable\"",
+                "apt-get update",
+                "apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin",
+                "systemctl enable docker",
+                "systemctl start docker",
+            },
+            "debian": {
+                "curl -fsSL https://download.docker.com/linux/debian/gpg | apt-key add -",
+                "add-apt-repository \"deb [arch=amd64] https://download.docker.com/linux/debian $(lsb_release -cs) stable\"",
+                "apt-get update",
+                "apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin",
+                "systemctl enable docker",
+                "systemctl start docker",
+            },
+            "fedora": {
+                "dnf -y remove docker docker-* podman* buildah*",
+                "dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo",
+                "dnf -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin",
+                "systemctl enable docker",
+                "systemctl start docker",
+            },
+            "rocky": {
+                "dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo",
+                "dnf -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin",
+                "systemctl enable docker",
+                "systemctl start docker",
+            },
+            "almalinux": {
+                "dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo",
+                "dnf -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin",
+                "systemctl enable docker",
+                "systemctl start docker",
+            },
+            "centos": {
+                "if [ -f /etc/centos-release ] && grep -q 'CentOS Linux release 7' /etc/centos-release; then " +
+                    "yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo && " +
+                    "yum -y install docker-ce docker-ce-cli containerd.io; " +
+                "else " +
+                    "dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo && " +
+                    "dnf -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin; " +
+                "fi",
+                "systemctl enable docker",
+                "systemctl start docker",
+            },
+        },
+    },
+    "nodejs": {
+        ID:          "nodejs",
+        Name:        "Node.js Development Environment",
+        Description: "Server with Node.js, NPM, and common development tools",
+        OSVariants:  []string{"ubuntu-22.04", "ubuntu-20.04", "debian-12", "debian-11", "fedora-40", "fedora-38", "rocky-9", "rocky-8", "almalinux-9", "almalinux-8", "centos-9", "centos-7"},
+        Packages: map[string][]string{
+            "ubuntu": {"curl", "build-essential"},
+            "debian": {"curl", "build-essential"},
+            "fedora": {"curl", "gcc", "gcc-c++", "make", "python3"},
+            "rocky": {"curl", "gcc", "gcc-c++", "make", "epel-release", "python3"},
+            "almalinux": {"curl", "gcc", "gcc-c++", "make", "epel-release", "python3"},
+            "centos": {"curl", "gcc", "gcc-c++", "make", "epel-release", "python3"},
+        },
+        Commands: map[string][]string{
+            "ubuntu": {
+                "curl -fsSL https://deb.nodesource.com/setup_18.x | bash -",
+                "apt-get install -y nodejs",
+                "npm install -g yarn pm2 typescript ts-node",
+            },
+            "debian": {
+                "curl -fsSL https://deb.nodesource.com/setup_18.x | bash -",
+                "apt-get install -y nodejs",
+                "npm install -g yarn pm2 typescript ts-node",
+            },
+            "fedora": {
+                "dnf -y module reset nodejs",
+                "dnf -y module enable nodejs:18",
+                "dnf -y install nodejs",
+                "npm install -g yarn pm2 typescript ts-node",
+            },
+            "rocky": {
+                "curl -fsSL https://rpm.nodesource.com/setup_18.x | bash -",
+                "dnf -y install nodejs",
+                "npm install -g yarn pm2 typescript ts-node",
+            },
+            "almalinux": {
+                "curl -fsSL https://rpm.nodesource.com/setup_18.x | bash -",
+                "dnf -y install nodejs",
+                "npm install -g yarn pm2 typescript ts-node",
+            },
+            "centos": {
+                "if [ -f /etc/centos-release ] && grep -q 'CentOS Linux release 7' /etc/centos-release; then " +
+                    "curl -fsSL https://rpm.nodesource.com/setup_18.x | bash - && " +
+                    "yum -y install nodejs; " +
+                "else " +
+                    "curl -fsSL https://rpm.nodesource.com/setup_18.x | bash - && " +
+                    "dnf -y install nodejs; " +
+                "fi",
+                "npm install -g yarn pm2 typescript ts-node",
+            },
+        },
+    },
+    "golang": {
+        ID:          "golang",
+        Name:        "Go Development Environment",
+        Description: "Server with Go and common development tools",
+        OSVariants:  []string{"ubuntu-22.04", "ubuntu-20.04", "debian-12", "debian-11", "fedora-40", "fedora-38", "rocky-9", "rocky-8", "almalinux-9", "almalinux-8", "centos-9", "centos-7"},
+        Packages: map[string][]string{
+            "ubuntu": {"curl", "git", "build-essential"},
+            "debian": {"curl", "git", "build-essential"},
+            "fedora": {"curl", "git", "gcc", "gcc-c++", "make"},
+            "rocky": {"curl", "git", "gcc", "gcc-c++", "make"},
+            "almalinux": {"curl", "git", "gcc", "gcc-c++", "make"},
+            "centos": {"curl", "git", "gcc", "gcc-c++", "make"},
+        },
+        Commands: map[string][]string{
+            "ubuntu": {
+                "curl -OL https://go.dev/dl/go1.21.5.linux-amd64.tar.gz",
+                "rm -rf /usr/local/go && tar -C /usr/local -xzf go1.21.5.linux-amd64.tar.gz",
+                "echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile",
+                "echo 'export PATH=$PATH:/usr/local/go/bin' >> /root/.bashrc",
+                "rm go1.21.5.linux-amd64.tar.gz",
+                "/usr/local/go/bin/go install golang.org/x/tools/gopls@latest",
+                "/usr/local/go/bin/go install github.com/go-delve/delve/cmd/dlv@latest",
+            },
+            "debian": {
+                "curl -OL https://go.dev/dl/go1.21.5.linux-amd64.tar.gz",
+                "rm -rf /usr/local/go && tar -C /usr/local -xzf go1.21.5.linux-amd64.tar.gz",
+                "echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile",
+                "echo 'export PATH=$PATH:/usr/local/go/bin' >> /root/.bashrc",
+                "rm go1.21.5.linux-amd64.tar.gz",
+                "/usr/local/go/bin/go install golang.org/x/tools/gopls@latest",
+                "/usr/local/go/bin/go install github.com/go-delve/delve/cmd/dlv@latest",
+            },
+            "fedora": {
+                "curl -OL https://go.dev/dl/go1.21.5.linux-amd64.tar.gz",
+                "rm -rf /usr/local/go && tar -C /usr/local -xzf go1.21.5.linux-amd64.tar.gz",
+                "echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile",
+                "echo 'export PATH=$PATH:/usr/local/go/bin' >> /root/.bashrc",
+                "rm go1.21.5.linux-amd64.tar.gz",
+                "/usr/local/go/bin/go install golang.org/x/tools/gopls@latest",
+                "/usr/local/go/bin/go install github.com/go-delve/delve/cmd/dlv@latest",
+            },
+            "rocky": {
+                "curl -OL https://go.dev/dl/go1.21.5.linux-amd64.tar.gz",
+                "rm -rf /usr/local/go && tar -C /usr/local -xzf go1.21.5.linux-amd64.tar.gz",
+                "echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile",
+                "echo 'export PATH=$PATH:/usr/local/go/bin' >> /root/.bashrc",
+                "rm go1.21.5.linux-amd64.tar.gz",
+                "/usr/local/go/bin/go install golang.org/x/tools/gopls@latest",
+                "/usr/local/go/bin/go install github.com/go-delve/delve/cmd/dlv@latest",
+            },
+            "almalinux": {
+                "curl -OL https://go.dev/dl/go1.21.5.linux-amd64.tar.gz",
+                "rm -rf /usr/local/go && tar -C /usr/local -xzf go1.21.5.linux-amd64.tar.gz",
+                "echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile",
+                "echo 'export PATH=$PATH:/usr/local/go/bin' >> /root/.bashrc",
+                "rm go1.21.5.linux-amd64.tar.gz",
+                "/usr/local/go/bin/go install golang.org/x/tools/gopls@latest",
+                "/usr/local/go/bin/go install github.com/go-delve/delve/cmd/dlv@latest",
+            },
+            "centos": {
+                "curl -OL https://go.dev/dl/go1.21.5.linux-amd64.tar.gz",
+                "rm -rf /usr/local/go && tar -C /usr/local -xzf go1.21.5.linux-amd64.tar.gz",
+                "echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile",
+                "echo 'export PATH=$PATH:/usr/local/go/bin' >> /root/.bashrc",
+                "rm go1.21.5.linux-amd64.tar.gz",
+                "/usr/local/go/bin/go install golang.org/x/tools/gopls@latest",
+                "/usr/local/go/bin/go install github.com/go-delve/delve/cmd/dlv@latest",
+            },
+        },
+    },
+    "python": {
+        ID:          "python",
+        Name:        "Python Development Environment",
+        Description: "Server with Python, pip, and common development tools",
+        OSVariants:  []string{"ubuntu-22.04", "ubuntu-20.04", "debian-12", "debian-11", "fedora-40", "fedora-38", "rocky-9", "rocky-8", "almalinux-9", "almalinux-8", "centos-9", "centos-7"},
+        Packages: map[string][]string{
+            "ubuntu": {"python3", "python3-pip", "python3-venv", "build-essential", "python3-dev", "git"},
+            "debian": {"python3", "python3-pip", "python3-venv", "build-essential", "python3-dev", "git"},
+            "fedora": {"python3", "python3-pip", "python3-devel", "gcc", "gcc-c++", "make", "git", "python3-wheel"},
+            "rocky": {"epel-release", "python3", "python3-pip", "python3-devel", "gcc", "gcc-c++", "make", "git"},
+            "almalinux": {"epel-release", "python3", "python3-pip", "python3-devel", "gcc", "gcc-c++", "make", "git"},
+            "centos": {"epel-release", "python3", "python3-pip", "python3-devel", "gcc", "gcc-c++", "make", "git"},
+        },
+        Commands: map[string][]string{
+            "ubuntu": {
+                "pip3 install --upgrade pip",
+                "pip3 install poetry virtualenv pylint black mypy pytest jupyter",
+                "echo 'alias python=python3' >> /root/.bashrc",
+                "echo 'alias pip=pip3' >> /root/.bashrc",
+            },
+            "debian": {
+                "pip3 install --upgrade pip",
+                "pip3 install poetry virtualenv pylint black mypy pytest jupyter",
+                "echo 'alias python=python3' >> /root/.bashrc",
+                "echo 'alias pip=pip3' >> /root/.bashrc",
+            },
+            "fedora": {
+                "dnf -y update",
+                "python3 -m ensurepip --upgrade",
+                "python3 -m pip install --upgrade pip setuptools wheel",
+                "python3 -m pip install poetry virtualenv pylint black mypy pytest jupyter",
+                "echo 'alias python=python3' >> /root/.bashrc",
+                "echo 'alias pip=pip3' >> /root/.bashrc",
+            },
+            "rocky": {
+                "dnf -y update",
+                "python3 -m pip install --upgrade pip",
+                "python3 -m pip install poetry virtualenv pylint black mypy pytest jupyter",
+                "echo 'alias python=python3' >> /root/.bashrc",
+                "echo 'alias pip=pip3' >> /root/.bashrc",
+            },
+            "almalinux": {
+                "dnf -y update",
+                "python3 -m pip install --upgrade pip",
+                "python3 -m pip install poetry virtualenv pylint black mypy pytest jupyter",
+                "echo 'alias python=python3' >> /root/.bashrc",
+                "echo 'alias pip=pip3' >> /root/.bashrc",
+            },
+            "centos": {
+                "if [ -f /etc/centos-release ] && grep -q 'CentOS Linux release 7' /etc/centos-release; then " +
+                    "yum -y update && " +
+                    "python3 -m pip install --upgrade pip && " +
+                    "python3 -m pip install poetry virtualenv pylint black mypy pytest jupyter; " +
+                "else " +
+                    "dnf -y update && " +
+                    "python3 -m pip install --upgrade pip && " +
+                    "python3 -m pip install poetry virtualenv pylint black mypy pytest jupyter; " +
+                "fi",
+                "echo 'alias python=python3' >> /root/.bashrc",
+                "echo 'alias pip=pip3' >> /root/.bashrc",
+            },
+        },
+    },
 }
 
 
@@ -283,51 +553,60 @@ func downloadAndPrepareBaseImage(imageType string) error {
     return nil
 }
 
-func createCloudInitISO(path string, rootPassword string, imageType string, hostname string) error {
+func prependIndent(commands []string, indent string) []string {
+    indented := make([]string, len(commands))
+    for i, cmd := range commands {
+        indented[i] = indent + cmd
+    }
+    return indented
+}
+
+func createCloudInitISO(path string, rootPassword string, imageType string, hostname string, template string) error {
     tmpDir, err := os.MkdirTemp("", "cloud-init")
     if err != nil {
         return err
     }
     defer os.RemoveAll(tmpDir)
 
-    var userData string
-    switch imageType {
-    case "arch-linux":
-        userData = fmt.Sprintf(`#cloud-config
-users:
-  - name: root
-    lock_passwd: false
-    ssh_pwauth: true
-    passwd: %s
+    // Get template configuration
+    templateConfig, exists := SUPPORTED_TEMPLATES[template]
+    if !exists {
+        templateConfig = SUPPORTED_TEMPLATES["blank"]
+    }
 
-ssh_pwauth: true
-disable_root: false
+    // Determine OS family for package management
+    osFamily := getOSFamily(imageType)
+    if osFamily == "" {
+        return fmt.Errorf("unsupported OS type: %s", imageType)
+    }
 
-bootcmd:
-  - systemctl enable sshd
-  - systemctl start sshd`, rootPassword)
-    
-    case "fedora-38", "fedora-40":
-        userData = fmt.Sprintf(`#cloud-config
-users:
-  - name: root
-    lock_passwd: false
-    ssh_pwauth: true
+    // Get OS-specific packages and commandsa
+    packages := templateConfig.Packages[osFamily]
+    commands := templateConfig.Commands[osFamily]
 
-chpasswd:
-  list: |
-    root:%s
-  expire: false
+    // Combine all commands including package installation
+    var allCommands []string
 
-ssh_pwauth: true
-disable_root: false
+    // Add package installation commands based on OS family
+    if len(packages) > 0 {
+        switch osFamily {
+        case "ubuntu", "debian":
+            allCommands = append(allCommands,
+                "apt-get update",
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y "+strings.Join(packages, " "))
+        case "fedora", "rocky", "almalinux", "centos":
+            allCommands = append(allCommands,
+                "dnf update -y",
+                "dnf install -y "+strings.Join(packages, " "))
+        }
+    }
 
-runcmd:
-  - sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-  - systemctl restart sshd`, rootPassword)
-    
-    default:
-        userData = fmt.Sprintf(`#cloud-config
+    // Add template-specific commands
+    allCommands = append(allCommands, commands...)
+
+    // Create cloud-init user-data content
+    var userData bytes.Buffer
+    userData.WriteString(fmt.Sprintf(`#cloud-config
 users:
   - name: root
     lock_passwd: false
@@ -343,12 +622,21 @@ disable_root: false
 
 hostname: %s
 
+package_update: true
+package_upgrade: true
+
+# Install required packages
+packages:
+%s
+
+# Run commands
 runcmd:
   - sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-  - systemctl restart ssh`, rootPassword, hostname)
-    }
+  - systemctl restart ssh || systemctl restart sshd
+%s
+`, rootPassword, hostname, formatPackageList(packages), formatCommandList(allCommands)))
 
-    if err := os.WriteFile(filepath.Join(tmpDir, "user-data"), []byte(userData), 0644); err != nil {
+    if err := os.WriteFile(filepath.Join(tmpDir, "user-data"), userData.Bytes(), 0644); err != nil {
         return err
     }
 
@@ -359,12 +647,113 @@ runcmd:
 
     cmd := exec.Command("genisoimage", "-output", path, "-volid", "cidata", "-joliet", "-rock",
         filepath.Join(tmpDir, "user-data"), filepath.Join(tmpDir, "meta-data"))
-
+    
     if output, err := cmd.CombinedOutput(); err != nil {
         return fmt.Errorf("failed to create ISO: %v, output: %s", err, string(output))
     }
 
     return nil
+}
+
+// Helper function to format command list for cloud-init
+func formatCommandList(commands []string) string {
+    var formatted strings.Builder
+    for _, cmd := range commands {
+        formatted.WriteString(fmt.Sprintf("  - %s\n", cmd))
+    }
+    return formatted.String()
+}
+
+// Helper function to format package list for cloud-init
+func formatPackageList(packages []string) string {
+    var formatted strings.Builder
+    for _, pkg := range packages {
+        formatted.WriteString(fmt.Sprintf("  - %s\n", pkg))
+    }
+    return formatted.String()
+}
+
+// Helper function to determine OS family
+func getOSFamily(imageType string) string {
+    switch {
+    case strings.HasPrefix(imageType, "ubuntu"):
+        return "ubuntu"
+    case strings.HasPrefix(imageType, "debian"):
+        return "debian"
+    case strings.HasPrefix(imageType, "fedora"):
+        return "fedora"
+    case strings.HasPrefix(imageType, "rocky"):
+        return "rocky"
+    case strings.HasPrefix(imageType, "almalinux"):
+        return "almalinux"
+    case strings.HasPrefix(imageType, "centos"):
+        return "centos"
+    default:
+        return ""
+    }
+}
+
+// Add validation for template and OS compatibility
+func validateTemplateAndOS(template string, imageType string) error {
+    templateConfig, exists := SUPPORTED_TEMPLATES[template]
+    if !exists {
+        return fmt.Errorf("unsupported template: %s", template)
+    }
+
+    if len(templateConfig.OSVariants) > 0 {
+        supported := false
+        for _, variant := range templateConfig.OSVariants {
+            if variant == imageType {
+                supported = true
+                break
+            }
+        }
+        if !supported {
+            return fmt.Errorf("template %s does not support OS %s", template, imageType)
+        }
+    }
+
+    return nil
+}
+
+// Modify the HTTP handler for listing templates to include OS compatibility
+func (m *VPSManager) handleListTemplates(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodGet {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    // Get OS filter from query parameter
+    osType := r.URL.Query().Get("os")
+
+    templates := make([]struct {
+        VPSTemplate
+        Compatible bool `json:"compatible"`
+    }, 0, len(SUPPORTED_TEMPLATES))
+
+    for _, template := range SUPPORTED_TEMPLATES {
+        compatible := true
+        if osType != "" {
+            compatible = false
+            for _, variant := range template.OSVariants {
+                if variant == osType {
+                    compatible = true
+                    break
+                }
+            }
+        }
+
+        templates = append(templates, struct {
+            VPSTemplate
+            Compatible bool `json:"compatible"`
+        }{
+            VPSTemplate: template,
+            Compatible: compatible,
+        })
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(templates)
 }
 
 func startWebsockifyProxy(vncPort int) error {
@@ -421,20 +810,21 @@ func stopWebsockifyProxy(vncPort int) error {
     return nil
 }
 
-func (m *VPSManager) CreateVPS(name string, hostname string, imageType string) (*VPS, error) {
+func (m *VPSManager) CreateVPS(name string, hostname string, imageType string, template string) (*VPS, error) {
     m.mutex.Lock()
     defer m.mutex.Unlock()
 
-    log.Printf("Starting VPS creation process for: %s with image: %s and hostname: %s", 
-        name, imageType, hostname)
+    log.Printf("Starting VPS creation process for: %s with image: %s, template: %s and hostname: %s", 
+        name, imageType, template, hostname)
 
-    // Initialize VPS with progress tracking
+    // Initialize VPS with template
     vps := &VPS{
         ID:          uuid.New().String(),
         Name:        name,
         Hostname:    hostname,
         Status:      "creating",
         ImageType:   imageType,
+        Template:    template,  // Add template to VPS struct
         VNCPort:     m.nextVNCPort,
         SSHPort:     m.nextSSHPort,
         CreatedAt:   time.Now(),
@@ -521,7 +911,7 @@ func (m *VPSManager) createVPSWithProgress(vps *VPS) error {
     // Create cloud-init ISO
     updateProgress(StagePreparingCloudInit, 60)
     cloudInitPath := filepath.Join(instanceDir, "cloud-init.iso")
-    if err := createCloudInitISO(cloudInitPath, vps.Password, vps.ImageType, vps.Hostname); err != nil {
+    if err := createCloudInitISO(cloudInitPath, vps.Password, vps.ImageType, vps.Hostname, vps.Template); err != nil {
         return fmt.Errorf("failed to create cloud-init ISO: %v", err)
     }
 
@@ -1037,54 +1427,34 @@ func (m *VPSManager) handleCreateVPS(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Get client IP
-    ip := r.Header.Get("X-Real-IP")
-    if ip == "" {
-        ip = r.Header.Get("X-Forwarded-For")
-    }
-    if ip == "" {
-        ip = r.RemoteAddr
-    }
-    
-    // Clean the IP address if it includes a port
-    if host, _, err := net.SplitHostPort(ip); err == nil {
-        ip = host
-    }
-
-    // Check if IP already has a VPS
-    if hasVPS, existingID := m.hasVPSForIP(ip); hasVPS {
-        http.Error(w, fmt.Sprintf("IP already has an active VPS (ID: %s)", existingID), http.StatusConflict)
-        return
-    }
-
     var req struct {
         Name      string `json:"name"`
         Hostname  string `json:"hostname"`
         ImageType string `json:"image_type"`
+        Template  string `json:"template"`
     }
+
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
         http.Error(w, err.Error(), http.StatusBadRequest)
         return
     }
 
+    // Set defaults if not provided
+    if req.Template == "" {
+        req.Template = "blank"
+    }
     if req.ImageType == "" {
         req.ImageType = "ubuntu-22.04"
     }
-
     if req.Hostname == "" {
         req.Hostname = req.Name + ".vps.local"
     }
 
-    vps, err := m.CreateVPS(req.Name, req.Hostname, req.ImageType)
+    vps, err := m.CreateVPS(req.Name, req.Hostname, req.ImageType, req.Template)
     if err != nil {
         http.Error(w, err.Error(), http.StatusInternalServerError)
         return
     }
-
-    // Associate the IP with the new VPS
-    m.mutex.Lock()
-    m.ipInstances[ip] = vps.ID
-    m.mutex.Unlock()
 
     json.NewEncoder(w).Encode(vps)
 }
@@ -1891,6 +2261,7 @@ func main() {
     apiMux.HandleFunc("/api/vps/start", manager.handleStartVPS)
     apiMux.HandleFunc("/api/vps/metrics", manager.handleGetMetrics)
     apiMux.HandleFunc("/api/vps/stop", manager.handleStopVPS)
+    apiMux.HandleFunc("/api/templates/list", manager.handleListTemplates)
     
     http.Handle("/api/", NewAuthMiddleware(apiKey, apiMux))
     http.Handle("/novnc/", http.StripPrefix("/novnc/", http.FileServer(http.Dir("/usr/share/novnc"))))

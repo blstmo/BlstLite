@@ -58,27 +58,62 @@ export async function getVPSList(): Promise<VPS[]> {
   }
   
 
-  export async function createVPS(params: CreateVPSParams) {
-    const response = await fetch(`${API_CONFIG.baseUrl}/api/vps/create`, {
-      method: 'POST',
+  export async function getAvailableTemplates(osType?: string) {
+    const url = new URL(`${API_CONFIG.baseUrl}/api/templates/list`);
+    if (osType) {
+      url.searchParams.append('os', osType);
+    }
+    
+    const response = await fetch(url, {
       headers: {
-        'Content-Type': 'application/json',
         'X-API-Key': API_CONFIG.apiKey!
-      },
-      body: JSON.stringify(params),
+      }
     });
   
     if (!response.ok) {
-      if (response.status === 409) {
-        throw new Error('You already have an active VPS. Only one VPS per IP address is allowed.');
-      }
-      const data = await response.json();
-      throw new Error(data.error || 'Failed to create VPS');
+      throw new Error('Failed to fetch available templates');
     }
   
     return response.json();
   }
   
+  // Modify the CreateVPSParams interface
+  interface CreateVPSParams {
+    name: string;
+    hostname: string;
+    image_type: string;
+    template: string;
+  }
+  
+  // Update the createVPS function to include the template parameter
+// app/actions.ts
+export async function createVPS(params: CreateVPSParams) {
+  console.log('Creating VPS with params:', params); // Add logging to verify data
+
+  const response = await fetch(`${API_CONFIG.baseUrl}/api/vps/create`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-API-Key': API_CONFIG.apiKey!
+    },
+    body: JSON.stringify({
+      name: params.name,
+      hostname: params.hostname,
+      image_type: params.image_type,
+      template: params.template  // Make sure template is included
+    }),
+  });
+
+  if (!response.ok) {
+    if (response.status === 409) {
+      throw new Error('You already have an active VPS. Only one VPS per IP address is allowed.');
+    }
+    const data = await response.json();
+    throw new Error(data.error || 'Failed to create VPS');
+  }
+
+  return response.json();
+}
 
 export async function checkVPSProgress(id: string) {
   const response = await fetch(`${API_CONFIG.baseUrl}/api/vps/progress?id=${id}`, {

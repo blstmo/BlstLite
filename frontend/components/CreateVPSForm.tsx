@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect } from 'react';
 import { VPS } from '@/types/vps';
-import { createVPS, checkVPSProgress, getVPSDetails, getAvailableImages } from '../app/actions';
+import { createVPS, checkVPSProgress, getVPSDetails, getAvailableImages, getAvailableTemplates } from '../app/actions';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -30,6 +30,13 @@ interface OSImage {
   version: number;
 }
 
+interface Template {
+  id: string;
+  name: string;
+  description: string;
+  compatible: boolean;
+}
+
 interface VPSProgress {
   stage: string;
   progress: number;
@@ -51,9 +58,11 @@ export default function CreateVPSForm({ onSuccess }: CreateVPSFormProps) {
   const [name, setName] = useState('');
   const [hostname, setHostname] = useState('');
   const [selectedImage, setSelectedImage] = useState<string>('');
+  const [selectedTemplate, setSelectedTemplate] = useState('blank');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [availableImages, setAvailableImages] = useState<OSImage[]>([]);
+  const [availableTemplates, setAvailableTemplates] = useState<Template[]>([]);
   const [creationProgress, setCreationProgress] = useState<VPSProgress | null>(null);
   const [vpsId, setVpsId] = useState<string | null>(null);
   
@@ -109,9 +118,13 @@ export default function CreateVPSForm({ onSuccess }: CreateVPSFormProps) {
   };
 
   useEffect(() => {
-    const fetchImages = async () => {
+    const fetchImagesAndTemplates = async () => {
       try {
-        const imageIds = await getAvailableImages();
+        const [imageIds, templatesData] = await Promise.all([
+          getAvailableImages(),
+          getAvailableTemplates()
+        ]);
+        
         const formattedImages = imageIds.map(getOSDetails);
         
         const categoryOrder = ['Ubuntu', 'Debian', 'Fedora', 'Enterprise Linux', 'Other'];
@@ -134,17 +147,42 @@ export default function CreateVPSForm({ onSuccess }: CreateVPSFormProps) {
         });
         
         setAvailableImages(formattedImages);
+        setAvailableTemplates(templatesData);
+        
         if (formattedImages.length > 0) {
           setSelectedImage(formattedImages[0].id);
         }
       } catch (err) {
-        console.error('Failed to fetch images:', err);
-        setError('Failed to load available images');
+        console.error('Failed to fetch data:', err);
+        setError('Failed to load available options');
       }
     };
 
-    fetchImages();
+    fetchImagesAndTemplates();
   }, []);
+
+  useEffect(() => {
+    const updateTemplates = async () => {
+      if (selectedImage) {
+        try {
+          const templates = await getAvailableTemplates(selectedImage);
+          setAvailableTemplates(templates);
+          
+          // If current template is not compatible with new OS, reset to blank
+          const isCurrentTemplateCompatible = templates.some(
+            t => t.id === selectedTemplate && t.compatible
+          );
+          if (!isCurrentTemplateCompatible) {
+            setSelectedTemplate('blank');
+          }
+        } catch (err) {
+          console.error('Failed to fetch templates:', err);
+        }
+      }
+    };
+
+    updateTemplates();
+  }, [selectedImage]);
 
   useEffect(() => {
     let progressInterval: NodeJS.Timeout;
@@ -192,7 +230,8 @@ export default function CreateVPSForm({ onSuccess }: CreateVPSFormProps) {
       const data = await createVPS({
         name,
         hostname,
-        image_type: selectedImage
+        image_type: selectedImage,
+        template: selectedTemplate
       });
       
       setVpsId(data.id);
@@ -201,7 +240,6 @@ export default function CreateVPSForm({ onSuccess }: CreateVPSFormProps) {
       const errorMessage = err instanceof Error ? err.message : 'Failed to create VPS';
       setError(errorMessage);
       
-      // If it's an IP limit error, show a more detailed message
       if (errorMessage.includes('already have an active VPS')) {
         setError(
           'You already have an active VPS. Only one VPS per IP address is allowed. ' +
@@ -301,6 +339,39 @@ export default function CreateVPSForm({ onSuccess }: CreateVPSFormProps) {
             ))}
           </Accordion>
         </div>
+
+        <div className="space-y-4">
+          <Label>Select Template</Label>
+          <div className="grid grid-cols-1 gap-4">
+            {availableTemplates.map((template) => (
+              <Card
+                key={template.id}
+                className={`p-4 cursor-pointer transition-all ${
+                  !template.compatible ? 'opacity-50 cursor-not-allowed' : 'hover:ring-2 hover:ring-primary'
+                } ${
+                  selectedTemplate === template.id ? 'ring-2 ring-primary bg-primary/5' : ''
+                }`}
+                onClick={() => {
+                  if (template.compatible) {
+                    setSelectedTemplate(template.id);
+                  }
+                }}
+              >
+                <div className="flex flex-col space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="font-medium">{template.name}</span>
+                    {!template.compatible && (
+                      <span className="text-sm text-muted-foreground">
+                        Not compatible with selected OS
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-sm text-muted-foreground">{template.description}</p>
+                </div>
+              </Card>
+            ))}
+          </div>
+        </div>
       </div>
 
       {error && (
@@ -317,7 +388,7 @@ export default function CreateVPSForm({ onSuccess }: CreateVPSFormProps) {
                 {STAGE_MESSAGES[creationProgress.stage as keyof typeof STAGE_MESSAGES]}
               </p>
               <p className="text-sm text-muted-foreground">
-                {creationProgress.stage.replace(/_/g, ' ')}
+              {creationProgress.stage.replace(/_/g, ' ')}
               </p>
             </div>
             <Loader2 className="h-4 w-4 animate-spin" />
