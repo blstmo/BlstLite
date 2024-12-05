@@ -155,13 +155,13 @@ var SUPPORTED_TEMPLATES = map[string]VPSTemplate{
         ID:          "blank",
         Name:        "Blank Server",
         Description: "Basic server with no additional software",
-        OSVariants:  []string{"ubuntu-22.04", "ubuntu-20.04", "debian-12", "debian-11", "fedora-40", "fedora-38", "rocky-9", "rocky-8", "almalinux-9", "almalinux-8", "centos-9", "centos-7"},
+        OSVariants:  []string{"ubuntu-24.04", "ubuntu-22.04", "ubuntu-20.04", "debian-12", "debian-11", "fedora-40", "fedora-38", "rocky-9", "rocky-8", "almalinux-9", "almalinux-8",},
     },
     "docker": {
         ID:          "docker",
         Name:        "Docker Development Environment",
         Description: "Server with Docker and Docker Compose pre-installed",
-        OSVariants:  []string{"ubuntu-22.04", "ubuntu-20.04", "debian-12", "debian-11", "fedora-40", "fedora-38", "rocky-9", "rocky-8", "almalinux-9", "almalinux-8", "centos-9", "centos-7"},
+        OSVariants:  []string{"ubuntu-22.04", "ubuntu-20.04", "debian-12", "debian-11", "fedora-40", "fedora-38", "rocky-9", "rocky-8", "almalinux-9", "almalinux-8"},
         Packages: map[string][]string{
             "ubuntu": {"apt-transport-https", "ca-certificates", "curl", "software-properties-common"},
             "debian": {"apt-transport-https", "ca-certificates", "curl", "software-properties-common"},
@@ -223,7 +223,7 @@ var SUPPORTED_TEMPLATES = map[string]VPSTemplate{
         ID:          "nodejs",
         Name:        "Node.js Development Environment",
         Description: "Server with Node.js, NPM, and common development tools",
-        OSVariants:  []string{"ubuntu-22.04", "ubuntu-20.04", "debian-12", "debian-11", "fedora-40", "fedora-38", "rocky-9", "rocky-8", "almalinux-9", "almalinux-8", "centos-9", "centos-7"},
+        OSVariants:  []string{"ubuntu-22.04", "ubuntu-20.04", "debian-12", "debian-11", "fedora-40", "fedora-38", "rocky-9", "rocky-8", "almalinux-9", "almalinux-8"},
         Packages: map[string][]string{
             "ubuntu": {"curl", "build-essential"},
             "debian": {"curl", "build-essential"},
@@ -275,7 +275,7 @@ var SUPPORTED_TEMPLATES = map[string]VPSTemplate{
         ID:          "golang",
         Name:        "Go Development Environment",
         Description: "Server with Go and common development tools",
-        OSVariants:  []string{"ubuntu-22.04", "ubuntu-20.04", "debian-12", "debian-11", "fedora-40", "fedora-38", "rocky-9", "rocky-8", "almalinux-9", "almalinux-8", "centos-9", "centos-7"},
+        OSVariants:  []string{"ubuntu-22.04", "ubuntu-20.04", "debian-12", "debian-11", "fedora-40", "fedora-38", "rocky-9", "rocky-8", "almalinux-9", "almalinux-8"},
         Packages: map[string][]string{
             "ubuntu": {"curl", "git", "build-essential"},
             "debian": {"curl", "git", "build-essential"},
@@ -345,7 +345,7 @@ var SUPPORTED_TEMPLATES = map[string]VPSTemplate{
         ID:          "python",
         Name:        "Python Development Environment",
         Description: "Server with Python, pip, and common development tools",
-        OSVariants:  []string{"ubuntu-22.04", "ubuntu-20.04", "debian-12", "debian-11", "fedora-40", "fedora-38", "rocky-9", "rocky-8", "almalinux-9", "almalinux-8", "centos-9", "centos-7"},
+        OSVariants:  []string{"ubuntu-22.04", "ubuntu-20.04", "debian-12", "debian-11", "fedora-40", "fedora-38", "rocky-9", "rocky-8", "almalinux-9", "almalinux-8"},
         Packages: map[string][]string{
             "ubuntu": {"python3", "python3-pip", "python3-venv", "build-essential", "python3-dev", "git"},
             "debian": {"python3", "python3-pip", "python3-venv", "build-essential", "python3-dev", "git"},
